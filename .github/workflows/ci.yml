@@ -1,10 +1,5 @@
-# Build, test, lint, and release-build anvil-engine on Linux and Windows, and
-# build and test it with Rust 1.99.1 on Linux.
-#
-# Path dependencies point at sibling directories, so the job checks this
-# repository out into its own folder and clones each sibling next to it.
-# Every cargo command runs with --offline: the project uses no crates from
-# outside the anvil repositories, and a registry download is a failure.
+# Build, vet, and test anvil-engine on Linux and Windows using Go.
+# Zero external dependencies in go.mod.
 
 name: ci
 
@@ -18,8 +13,7 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
-  CARGO_NET_OFFLINE: "true"
+  CGO_ENABLED: "0"
 
 jobs:
   ci:
@@ -32,19 +26,9 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: anvil-engine
     steps:
       - name: Check out
         uses: actions/checkout@v4
-        with:
-          path: anvil-engine
-
-      - name: Check out sibling repositories
-        working-directory: .
-        run: |
-          for repo in anvil-browser anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
-            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
-          done
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -52,79 +36,18 @@ jobs:
           go-version: ">=1.22"
           cache: false
 
-      - name: Install Rust
+      - name: Check for outside Go modules
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup default stable
-          rustc --version
-          cargo --version
-
-      - name: Check for outside crates
-        run: |
-          # Resolve offline first: most anvil repositories do not track
-          # Cargo.lock, so a fresh checkout has none until cargo writes it.
-          # Path dependencies have no source line in Cargo.lock. Registry and
-          # git dependencies do.
-          cargo metadata --offline --format-version 1 > /dev/null
-          if grep -n '^source = ' Cargo.lock; then
-            echo "Cargo.lock lists a crate from outside the anvil repositories."
+          if grep -E 'require|replace' go.mod; then
+            echo "go.mod lists external dependencies."
             exit 1
           fi
 
-      - name: Build
-      # anvil-raster and anvil-script build C++20 helpers: g++ on Linux,
-      # the Visual Studio cl.exe on Windows. Both runners ship a compiler.
-        run: cargo build --offline --workspace --all-targets
+      - name: Vet
+        run: go vet ./...
 
       - name: Test
-        run: cargo test --offline --workspace
+        run: go test -v ./...
 
-      - name: Clippy
-        run: cargo clippy --offline --workspace --all-targets -- -D warnings
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Release build
-        run: cargo build --offline --workspace --release
-
-  msrv:
-    # Rust 1.99.1 is the oldest toolchain the README promises. Build and test
-    # the whole workspace with it so newer syntax or library calls show up here.
-    name: rust 1.99.1
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-        working-directory: anvil-engine
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-        with:
-          path: anvil-engine
-
-      - name: Check out sibling repositories
-        working-directory: .
-        run: |
-          for repo in anvil-browser anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
-            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
-          done
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ">=1.22"
-          cache: false
-
-      - name: Install Rust 1.99.1
-        run: |
-          rustup toolchain install 1.99.1 --profile minimal
-          rustup default 1.99.1
-          rustc --version
-          cargo --version
-
-      - name: Build
-        run: cargo build --offline --workspace --all-targets
-
-      - name: Test
-        run: cargo test --offline --workspace
+      - name: Build CLI and worker binary
+        run: go build ./cmd/anvil-engine
