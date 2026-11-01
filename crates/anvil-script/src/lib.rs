@@ -63,7 +63,8 @@ pub use wasm::{
 };
 
 use anvil_dom::{Document, NodeId};
-use anvil_json::{JsonValue, parse_json, to_json_string};
+pub mod anvil_json;
+use crate::anvil_json::{JsonValue, parse_json, to_json_string};
 pub use cinder::{
     RUNTIME_BUILTINS_JS, RUNTIME_JSON_CODEC_JS, RUNTIME_WEB_APIS_JS, self_hosted_bundle,
     self_hosted_bundle_hash, self_hosted_runtime_bundle,
@@ -11584,6 +11585,13 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains("new CSSStyleSheet")
         || cleaned.contains("document.adoptedStyleSheets")
         || cleaned.contains("new MutationObserver")
+        || cleaned.contains("MutationObserver")
+        || cleaned.contains("customElements")
+        || cleaned.contains("HTMLElement")
+        || cleaned.contains("attachShadow")
+        || cleaned.contains("shadowRoot")
+        || cleaned.contains("assignedNodes")
+        || cleaned.contains("assignedElements")
         || cleaned.contains("new IntersectionObserver")
         || cleaned.contains("new ResizeObserver")
         || cleaned.contains("function*")
@@ -15055,6 +15063,184 @@ mod tests {
         assert_eq!(
             doc.text_content(out),
             "208/208/200/320/60|auto/\"TAG:\"|true/confirmed:false|false:true/true/false:true:Taken/true|60|note.txt:clip:hello-anvil"
+        );
+    }
+
+    #[test]
+    fn cinder_engine_executes_mutation_observer_custom_elements_and_shadow_dom_slots() {
+        let mut doc = parse_html(
+            "<html><head><style>
+               x-card::part(badge) { width: 140px; height: 32px; }
+             </style></head><body>
+               <div id=\"container\" data-init=\"0\">
+                 <span id=\"first\">A</span>
+               </div>
+               <x-card id=\"pre-card\" status=\"boot\">
+                 <span id=\"slotted-title\" slot=\"title\">Header</span>
+                 <p id=\"slotted-body\">Body Text</p>
+               </x-card>
+               <div id=\"closed-host\"></div>
+               <p id=\"out\">init</p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_with_cinder_engine(
+            &mut doc,
+            r##"
+            const log = [];
+
+            class XCard extends HTMLElement {
+                static get observedAttributes() {
+                    return ["status"];
+                }
+                constructor() {
+                    super();
+                    this.changes = [];
+                }
+                connectedCallback() {
+                    log.push("ce:conn:" + this.id);
+                    if (!this.shadowRoot) {
+                        const sr = this.attachShadow({ mode: "open" });
+                        sr.innerHTML = "<style>:host { display: block; width: 240px; } ::slotted([slot=title]) { color: rgb(10, 20, 30); }</style><header part=\"badge\"><slot name=\"title\"></slot></header><section><slot></slot></section>";
+                    }
+                }
+                disconnectedCallback() {
+                    log.push("ce:disc:" + this.id);
+                }
+                adoptedCallback() {
+                    log.push("ce:adopt:" + this.id);
+                }
+                attributeChangedCallback(name, oldVal, newVal) {
+                    this.changes.push(name + ":" + oldVal + "->" + newVal);
+                }
+            }
+
+            let definedResolved = false;
+            customElements.whenDefined("x-card").then(() => {
+                definedResolved = true;
+            });
+            customElements.define("x-card", XCard);
+
+            const preCard = document.getElementById("pre-card");
+            preCard.setAttribute("status", "ready");
+            const dynCard = document.createElement("x-card");
+            dynCard.id = "dyn-card";
+            document.body.appendChild(dynCard);
+            document.adoptNode(dynCard);
+            document.body.removeChild(dynCard);
+
+            const sr = preCard.shadowRoot;
+            const slots = sr.querySelectorAll("slot");
+            const titleSlot = slots[0];
+            const defaultSlot = slots[1];
+            const assignedTitle = titleSlot.assignedElements();
+            const assignedDefault = defaultSlot.assignedElements();
+            const slottedTitleEl = document.getElementById("slotted-title");
+            const slotMatch = (slottedTitleEl.assignedSlot === titleSlot) + ":" + slottedTitleEl.slot;
+            const hostMatch = (sr.host === preCard) + ":" + sr.mode;
+
+            const closedHost = document.getElementById("closed-host");
+            const closedSr = closedHost.attachShadow({ mode: "closed" });
+            const closedCheck = (closedHost.shadowRoot === null) + ":" + closedSr.mode;
+
+            const cardRect = preCard.getBoundingClientRect();
+
+            const container = document.getElementById("container");
+            const moEvents = [];
+            const mo = new MutationObserver((records) => {
+                for (const r of records) {
+                    if (r.type === "attributes") {
+                        moEvents.push("attr:" + r.attributeName + ":" + r.oldValue);
+                    } else if (r.type === "childList") {
+                        moEvents.push("child:+" + r.addedNodes.length + ":-" + r.removedNodes.length + ":prev=" + (r.previousSibling ? r.previousSibling.id : "none"));
+                    } else if (r.type === "characterData") {
+                        moEvents.push("char:" + r.oldValue);
+                    }
+                }
+            });
+            mo.observe(container, {
+                attributes: true,
+                attributeOldValue: true,
+                attributeFilter: ["data-init"],
+                childList: true,
+                characterData: true,
+                characterDataOldValue: true,
+                subtree: true
+            });
+
+            container.setAttribute("data-init", "1");
+            container.setAttribute("data-ignored", "x");
+            const second = document.createElement("span");
+            second.id = "second";
+            container.appendChild(second);
+            const firstText = document.getElementById("first").firstChild;
+            firstText.data = "B";
+
+            const taken = mo.takeRecords();
+            const takenSummary = taken.map((r) => r.type).join(",");
+            container.setAttribute("data-init", "2");
+
+            Promise.resolve().then(() => {
+                mo.disconnect();
+                container.setAttribute("data-init", "3");
+                document.getElementById("out").textContent =
+                    log.join(",") +
+                    "|" + preCard.changes.join(",") +
+                    "|" + (customElements.get("x-card") === XCard) + ":" + customElements.getName(XCard) + ":" + definedResolved +
+                    "|" + assignedTitle.length + ":" + assignedDefault.length + ":" + slotMatch + "|" + hostMatch +
+                    "|" + closedCheck +
+                    "|" + cardRect.width +
+                    "|" + takenSummary +
+                    "|" + moEvents.join(",");
+            });
+            "##,
+        )
+        .expect("run mutation observer, custom elements, and shadow dom suite");
+
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "ce:conn:pre-card,ce:conn:dyn-card,ce:disc:dyn-card,ce:adopt:dyn-card|status:null->boot,status:boot->ready|true:x-card:true|1:1:true:title|true:open|true:closed|240|attributes,childList,characterData|attr:data-init:1"
+        );
+    }
+
+    #[test]
+    fn cinder_engine_executes_intersection_observer_root_margin_and_thresholds() {
+        let mut doc = parse_html(
+            "<html><head><style>
+               html, body { margin: 0; padding: 0; }
+               #target { width: 100px; height: 50px; }
+             </style></head><body>
+               <div id=\"target\">Box</div>
+               <p id=\"out\">init</p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_with_cinder_engine(
+            &mut doc,
+            r##"
+            const target = document.getElementById("target");
+            let entrySnap = "";
+            const io = new IntersectionObserver((entries) => {
+                const e = entries[0];
+                entrySnap = e.isIntersecting + ":" + e.intersectionRatio + ":" + e.rootBounds.width + "x" + e.rootBounds.height;
+            }, {
+                rootMargin: "20px 10%",
+                threshold: [0.75, 0, 0.25]
+            });
+            io.observe(target);
+            Promise.resolve().then(() => {
+                document.getElementById("out").textContent =
+                    io.thresholds.join(",") + "|" + io.rootMargin + "|" + entrySnap;
+            });
+            "##,
+        )
+        .expect("run intersection observer rootMargin and thresholds test");
+
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "0,0.25,0.75|20px 10%|true:1:1536x840"
         );
     }
 }

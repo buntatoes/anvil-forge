@@ -46,6 +46,12 @@ jobs:
             git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+          cache: false
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
@@ -103,6 +109,12 @@ jobs:
           for repo in anvil-browser anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
             git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+          cache: false
 
       - name: Install Rust 1.99.1
         run: |

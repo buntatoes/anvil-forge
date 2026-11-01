@@ -744,6 +744,148 @@ pub fn layout_document_interactive(
     tree
 }
 
+/// Incremental layout cache that memoizes computed [`LayoutBox`] subtrees and
+/// full-document layout passes across restages when DOM structure, computed
+/// styles, images, scroll offsets, and viewport dimensions are unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct LayoutCache {
+    doc_fingerprint: u64,
+    cached_root: Option<LayoutBox>,
+    node_boxes: HashMap<NodeId, LayoutBox>,
+    hits: usize,
+    misses: usize,
+}
+
+impl LayoutCache {
+    /// Create an empty [`LayoutCache`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clear all cached layout state.
+    pub fn invalidate(&mut self) {
+        self.doc_fingerprint = 0;
+        self.cached_root = None;
+        self.node_boxes.clear();
+    }
+
+    /// Invalidate a specific DOM node and force the next incremental pass to recompute.
+    pub fn invalidate_node(&mut self, node: NodeId) {
+        self.node_boxes.remove(&node);
+        self.doc_fingerprint = 0;
+        self.cached_root = None;
+    }
+
+    /// Number of incremental layout cache hits recorded on this cache.
+    pub fn hits(&self) -> usize {
+        self.hits
+    }
+
+    /// Number of incremental layout cache misses recorded on this cache.
+    pub fn misses(&self) -> usize {
+        self.misses
+    }
+
+    /// Look up the most recently cached [`LayoutBox`] for `node`.
+    pub fn cached_box(&self, node: NodeId) -> Option<&LayoutBox> {
+        self.node_boxes.get(&node)
+    }
+
+    fn index_subtree(&mut self, b: &LayoutBox) {
+        self.node_boxes.insert(b.node, b.clone());
+        for child in &b.children {
+            self.index_subtree(child);
+        }
+    }
+}
+
+fn fnv1a_mix(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn hash_node_recursive(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    id: NodeId,
+    mut hash: u64,
+) -> u64 {
+    hash = fnv1a_mix(hash, &id.index().to_le_bytes());
+    let node = doc.get(id);
+    match node.data() {
+        NodeData::Document => hash = fnv1a_mix(hash, &[1]),
+        NodeData::Text(t) => {
+            hash = fnv1a_mix(hash, &[2]);
+            hash = fnv1a_mix(hash, t.as_bytes());
+        }
+        NodeData::Element { tag, attrs } => {
+            hash = fnv1a_mix(hash, &[3]);
+            hash = fnv1a_mix(hash, tag.as_bytes());
+            for (k, v) in attrs {
+                hash = fnv1a_mix(hash, k.as_bytes());
+                hash = fnv1a_mix(hash, v.as_bytes());
+            }
+        }
+    }
+    let (sx, sy) = doc.node_scroll_offset(id);
+    hash = fnv1a_mix(hash, &sx.to_bits().to_le_bytes());
+    hash = fnv1a_mix(hash, &sy.to_bits().to_le_bytes());
+    let style_dbg = format!("{:?}", styles.get(id));
+    hash = fnv1a_mix(hash, style_dbg.as_bytes());
+    if let Some(img) = images.get(&id) {
+        hash = fnv1a_mix(hash, &img.width.to_le_bytes());
+        hash = fnv1a_mix(hash, &img.height.to_le_bytes());
+    }
+    for &child in doc.children(id) {
+        hash = hash_node_recursive(doc, styles, images, child, hash);
+    }
+    hash
+}
+
+/// Lay out `doc` incrementally using `cache`. When the document, styles,
+/// images, scroll offsets, focused input, and viewport dimensions match the
+/// cached pass, the cached [`LayoutBox`] tree is returned directly.
+pub fn layout_document_incremental(
+    doc: &Document,
+    styles: &StyleMap,
+    viewport_width: f32,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+    cache: &mut LayoutCache,
+) -> LayoutBox {
+    let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
+    fp = fnv1a_mix(fp, &viewport_width.max(0.0).to_bits().to_le_bytes());
+    fp = fnv1a_mix(fp, &styles.viewport_width().to_bits().to_le_bytes());
+    fp = fnv1a_mix(fp, &styles.viewport_height().to_bits().to_le_bytes());
+    fp = fnv1a_mix(
+        fp,
+        &focused_input
+            .map(|n| n.index())
+            .unwrap_or(usize::MAX)
+            .to_le_bytes(),
+    );
+    fp = hash_node_recursive(doc, styles, images, doc.html(), fp);
+
+    if cache.doc_fingerprint == fp
+        && let Some(root) = &cache.cached_root
+    {
+        cache.hits += 1;
+        return root.clone();
+    }
+
+    cache.misses += 1;
+    let tree = layout_document_interactive(doc, styles, viewport_width, images, focused_input);
+    cache.node_boxes.clear();
+    cache.index_subtree(&tree);
+    cache.doc_fingerprint = fp;
+    cache.cached_root = Some(tree.clone());
+    tree
+}
+
 /// Record or apply `position: sticky` once every box has its final position.
 ///
 /// `clip_port` is the padding box of the nearest ancestor with hidden
@@ -1679,7 +1821,7 @@ fn layout_block(
                 }
             }
         }
-        for child in doc.children(id) {
+        for child in doc.composed_children(id).iter() {
             if is_skipped(doc, styles, *child) {
                 continue;
             }
@@ -3153,7 +3295,7 @@ fn layout_grid(
 
     let mut in_flow = Vec::new();
     let mut out_of_flow = Vec::new();
-    for &cid in doc.children(id) {
+    for &cid in doc.composed_children(id).iter() {
         if is_skipped(doc, styles, cid) {
             continue;
         }
@@ -3814,7 +3956,7 @@ fn layout_flex(
 
     let mut visible_children = Vec::new();
     let mut out_of_flow = Vec::new();
-    for &child in doc.children(id) {
+    for &child in doc.composed_children(id).iter() {
         if is_skipped(doc, styles, child) {
             continue;
         }
@@ -4801,7 +4943,7 @@ fn gather(
                 });
             }
             let style = *styles.get(id);
-            for child in doc.children(id) {
+            for child in doc.composed_children(id).iter() {
                 gather(doc, styles, *child, &style, out);
             }
             if let Some((a_txt, a_style)) = styles.after_style(id)
@@ -4877,7 +5019,7 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     if matches!(doc.get(id).data().tag(), Some("svg" | "progress" | "meter")) {
         return false;
     }
-    for child in doc.children(id) {
+    for child in doc.composed_children(id).iter() {
         if let NodeData::Element { tag, .. } = doc.get(*child).data()
             && (tag == "img"
                 || tag == "video"
@@ -6062,13 +6204,13 @@ mod tests {
                 #bbox { box-sizing: border-box; width: 180px; min-height: 40px; padding: 10px; border: 2px solid #111; }
                 #col { display: flex; flex-direction: column; align-items: center; width: 400px; }
                 #col_child { width: 120px; height: 20px; }
-                #ghost { visibility: hidden; width: 100px; height: 30px; background: #ff0000; }
+                #hidden-box { visibility: hidden; width: 100px; height: 30px; background: #ff0000; }
              </style>
              <div id=\"centered\"></div>
              <div id=\"row\"><span id=\"b1\" class=\"ib\"></span><span id=\"b2\" class=\"ib\"></span></div>
              <div id=\"bbox\"></div>
              <div id=\"col\"><div id=\"col_child\"></div></div>
-             <div id=\"ghost\">Hidden text</div>",
+             <div id=\"hidden-box\">Hidden text</div>",
             400.0,
         );
         let centered = find_box(&doc, &tree, "centered");
@@ -6089,11 +6231,11 @@ mod tests {
         let col_child = find_box(&doc, &tree, "col_child");
         assert_eq!(col_child.rect.x, 140.0);
 
-        let ghost = find_box(&doc, &tree, "ghost");
-        assert_eq!(ghost.rect.width, 100.0);
-        assert_eq!(ghost.rect.height, 30.0);
-        assert!(ghost.background.is_none());
-        assert!(ghost.text.is_empty());
+        let hidden_box = find_box(&doc, &tree, "hidden-box");
+        assert_eq!(hidden_box.rect.width, 100.0);
+        assert_eq!(hidden_box.rect.height, 30.0);
+        assert!(hidden_box.background.is_none());
+        assert!(hidden_box.text.is_empty());
     }
 
     #[test]
@@ -6540,5 +6682,70 @@ mod tests {
             tree.find_scrollable_container(10.0, scroll_box.rect.y + 10.0)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn lays_out_shadow_dom_composed_tree_and_slotted_projection() {
+        let mut doc = parse_html(
+            "<style>html, body { margin: 0; padding: 0; }</style>\
+             <div id=\"host\" style=\"display: flex; gap: 10px; width: 300px;\">\
+               <div id=\"light-b\" slot=\"second\" style=\"width: 80px; height: 30px;\">Second</div>\
+               <div id=\"light-a\" slot=\"first\" style=\"width: 60px; height: 30px;\">First</div>\
+               <div id=\"unslotted\" style=\"width: 90px; height: 30px;\">Hidden</div>\
+             </div>",
+        );
+        let host = doc.get_element_by_id("host").unwrap();
+        let sr = doc.attach_shadow(host, true);
+        doc.set_inner_html(
+            sr,
+            "<slot name=\"first\"></slot>\
+             <slot name=\"second\"></slot>\
+             <slot name=\"fallback\"><div id=\"fb\" style=\"width: 40px; height: 30px;\">Fallback</div></slot>",
+        );
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let tree = layout_document(&doc, &styles, 400.0);
+
+        // `#light-a` is projected into `<slot name="first">` at x = 0
+        let box_a = find_box(&doc, &tree, "light-a");
+        // `#light-b` is projected into `<slot name="second">` after `#light-a` + 10px gap
+        let box_b = find_box(&doc, &tree, "light-b");
+        assert_eq!(box_a.rect.x, 0.0);
+        assert_eq!(box_a.rect.width, 60.0);
+        assert_eq!(box_b.rect.x, 70.0);
+        assert_eq!(box_b.rect.width, 80.0);
+        // `#unslotted` has no matching `<slot>` and is not laid out in the composed tree
+        let host_box = find_box(&doc, &tree, "host");
+        assert_eq!(host_box.children.len(), 3);
+    }
+
+    #[test]
+    fn incremental_layout_cache_reuses_unchanged_tree_and_invalidates_on_mutation() {
+        let mut doc = parse_html(
+            "<style>html, body { margin: 0; padding: 0; }</style>\
+             <div id=\"card\" style=\"width: 150px; height: 60px;\">Hello</div>",
+        );
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let images = HashMap::new();
+        let mut cache = LayoutCache::new();
+
+        let first = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+        let card_id = doc.get_element_by_id("card").unwrap();
+        assert_eq!(cache.cached_box(card_id).unwrap().rect.width, 150.0);
+
+        // Identical pass hits the cache
+        let second = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(first, second);
+
+        // Mutating DOM attribute invalidates fingerprint and recomputes
+        doc.set_attribute(card_id, "style", "width: 240px; height: 80px;");
+        let styles2 = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let third = layout_document_incremental(&doc, &styles2, 400.0, &images, None, &mut cache);
+        assert_eq!(cache.misses(), 2);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(find_box(&doc, &third, "card").rect.width, 240.0);
     }
 }

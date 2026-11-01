@@ -163,6 +163,7 @@ pub fn parse_html(input: &str) -> Document {
         }
     }
 
+    doc.clear_dirty_styles();
     doc
 }
 

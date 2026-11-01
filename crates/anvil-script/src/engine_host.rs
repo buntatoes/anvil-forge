@@ -68,6 +68,17 @@ pub struct CinderDomHost {
     pub canvas_paths: std::collections::HashMap<NodeId, Vec<(i32, i32)>>,
     /// Active `MutationObserver` registrations: `(callback, observed_node)`.
     pub mutation_observers: Vec<(Persistent, NodeId)>,
+    /// True when one or more custom elements have been defined via `customElements.define`.
+    pub has_custom_elements: bool,
+    /// Cached stylesheet, resolved `StyleMap`, and `Animator` for incremental style invalidation.
+    style_cache: Option<(
+        String,
+        u32,
+        u32,
+        anvil_style::Stylesheet,
+        anvil_style::StyleMap,
+        anvil_style::Animator,
+    )>,
     /// Registered mock responses for `fetch(url)`: `(url, status, body)`.
     pub fetch_mocks: Vec<(String, u16, String)>,
     /// Active layout viewport width in CSS pixels (`window.innerWidth`).
@@ -110,40 +121,53 @@ impl CinderDomHost {
             next_timer_id: 1,
             canvas_paths: std::collections::HashMap::new(),
             mutation_observers: Vec::new(),
+            has_custom_elements: false,
+            style_cache: None,
             fetch_mocks: Vec::new(),
             viewport_width: 1280.0,
             viewport_height: 800.0,
         }
     }
 
-    /// Collect document `<style>` rules and `adoptedStyleSheets` and cascade styles.
-    pub fn compute_styles(&self) -> anvil_style::StyleMap {
-        let mut css_src = String::new();
-        for sid in self.doc.query_selector_all("style") {
-            let txt = self.doc.text_content(sid);
-            if !txt.trim().is_empty() {
-                css_src.push_str(&txt);
-                css_src.push('\n');
-            }
+    /// Collect document `<style>` rules and `adoptedStyleSheets` and cascade styles
+    /// (incrementally re-evaluating only dirty subtrees when the stylesheet and viewport are unchanged).
+    pub fn compute_styles(&mut self) -> anvil_style::StyleMap {
+        let css_src = self.doc.embedded_css();
+        let vw_bits = self.viewport_width.to_bits();
+        let vh_bits = self.viewport_height.to_bits();
+        if let Some((cached_css, cached_vw, cached_vh, sheet, styles, animator)) =
+            self.style_cache.as_mut()
+            && *cached_css == css_src
+            && *cached_vw == vw_bits
+            && *cached_vh == vh_bits
+        {
+            let _ = anvil_style::compute_styles_incremental(
+                &mut self.doc,
+                sheet,
+                styles,
+                self.viewport_width,
+                self.viewport_height,
+                Some(animator),
+            );
+            return styles.clone();
         }
-        for sheet_css in self.doc.adopted_style_sheets() {
-            if !sheet_css.trim().is_empty() {
-                css_src.push_str(sheet_css);
-                css_src.push('\n');
-            }
-        }
+        self.doc.clear_dirty_styles();
         let sheet = anvil_style::parse_css(&css_src);
-        anvil_style::compute_styles_for_viewport(
+        let mut animator = anvil_style::Animator::new();
+        let styles = anvil_style::compute_styles_animated(
             &self.doc,
             &sheet,
             self.viewport_width,
             self.viewport_height,
-        )
+            &mut animator,
+        );
+        self.style_cache = Some((css_src, vw_bits, vh_bits, sheet, styles.clone(), animator));
+        styles
     }
 
     /// Resolve styles and compute layout for `self.doc`, returning the [`anvil_layout::LayoutBox`]
     /// for `nid` if it participates in layout.
-    pub fn compute_node_box(&self, nid: NodeId) -> Option<anvil_layout::LayoutBox> {
+    pub fn compute_node_box(&mut self, nid: NodeId) -> Option<anvil_layout::LayoutBox> {
         let styles = self.compute_styles();
         let layout = anvil_layout::layout_document(&self.doc, &styles, self.viewport_width);
         layout.find_node_box(nid).cloned()
@@ -202,6 +226,8 @@ impl CinderDomHost {
             ("checkValidity", el_check_validity),
             ("reportValidity", el_report_validity),
             ("setCustomValidity", el_set_custom_validity),
+            ("assignedNodes", el_assigned_nodes),
+            ("assignedElements", el_assigned_elements),
         ] {
             vm.define_method(el_proto, name, func)?;
         }
@@ -243,6 +269,7 @@ impl CinderDomHost {
                 Some(el_get_node_value),
                 Some(el_set_node_value),
             ),
+            ("data", Some(el_get_node_value), Some(el_set_node_value)),
             ("ownerDocument", Some(el_get_owner_document), None),
             ("isConnected", Some(el_get_is_connected), None),
             ("parentElement", Some(el_get_parent_element), None),
@@ -267,6 +294,10 @@ impl CinderDomHost {
             ("children", Some(el_get_children), None),
             ("childElementCount", Some(el_get_child_element_count), None),
             ("shadowRoot", Some(el_get_shadow_root), None),
+            ("host", Some(el_get_shadow_host), None),
+            ("mode", Some(el_get_shadow_mode), None),
+            ("slot", Some(el_get_slot), Some(el_set_slot)),
+            ("assignedSlot", Some(el_get_assigned_slot), None),
             ("classList", Some(el_get_class_list), None),
             ("style", Some(el_get_style), None),
             ("dataset", Some(el_get_dataset), None),
@@ -1165,10 +1196,32 @@ fn doc_adopt_node(
     let Some(nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) else {
         return Ok(JsValue::NULL);
     };
+    let parent = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).parent());
     if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.remove_node(nid);
     }
-    wrap_node(cx, nid)
+    if let Some(p) = parent {
+        notify_child_mutation(cx, p, &[], &[nid], None, None)?;
+    }
+    let has_ce = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.has_custom_elements);
+    let node_val = wrap_node(cx, nid)?;
+    if has_ce {
+        cx.keep(node_val);
+        let g = cx.vm().global();
+        if let Ok(key) = cx.heap().key_from_str("__onCustomElementAdopted")
+            && let Ok(Some(prop)) = cx.heap().get_own(g, key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let doc_val = el_get_owner_document(cx, JsValue::UNDEFINED, &[])?;
+            let _ = cx.call(fn_val, JsValue::object(g), &[node_val, doc_val, doc_val]);
+        }
+    }
+    Ok(node_val)
 }
 
 fn doc_import_node(
@@ -1365,10 +1418,12 @@ fn el_set_attribute(
     };
     let name = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr(&name).map(str::to_string);
         h.doc.set_attribute(nid, &name, &val);
-    }
-    notify_mutation(cx, nid, "attributes", Some(&name))?;
+        prev
+    });
+    notify_attr_mutation(cx, nid, &name, old_val, Some(val))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1381,10 +1436,12 @@ fn el_remove_attribute(
         return Ok(JsValue::UNDEFINED);
     };
     let name = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr(&name).map(str::to_string);
         h.doc.remove_attribute(nid, &name);
-    }
-    notify_mutation(cx, nid, "attributes", Some(&name))?;
+        prev
+    });
+    notify_attr_mutation(cx, nid, &name, old_val, None)?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1415,17 +1472,33 @@ fn el_append_child(
     let Some(child_id) = unwrap_node(cx, child_val) else {
         return Ok(child_val);
     };
+    let mut added = Vec::new();
+    let mut prev_sib = None;
+    let mut old_parent_removed: Option<(NodeId, NodeId)> = None;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        prev_sib = h.doc.last_child(parent_id);
         if h.doc.get(child_id).data().tag() == Some("anvil-fragment") {
             let kids: Vec<NodeId> = h.doc.children(child_id).to_vec();
             for k in kids {
                 let _ = h.doc.append(parent_id, k);
+                added.push(k);
             }
         } else {
+            if let Some(old_p) = h.doc.get(child_id).parent()
+                && old_p != parent_id
+            {
+                old_parent_removed = Some((old_p, child_id));
+            }
             let _ = h.doc.append(parent_id, child_id);
+            added.push(child_id);
         }
     }
-    notify_mutation(cx, parent_id, "childList", None)?;
+    if let Some((old_p, rem_id)) = old_parent_removed {
+        notify_child_mutation(cx, old_p, &[], &[rem_id], None, None)?;
+    }
+    if !added.is_empty() {
+        notify_child_mutation(cx, parent_id, &added, &[], prev_sib, None)?;
+    }
     Ok(child_val)
 }
 
@@ -1438,12 +1511,21 @@ fn el_remove_child(
         return Ok(JsValue::NULL);
     };
     let child_val = args.first().copied().unwrap_or(JsValue::NULL);
+    let mut removed = Vec::new();
+    let mut prev_sib = None;
+    let mut next_sib = None;
     if let Some(child_id) = unwrap_node(cx, child_val)
         && let Some(h) = cx.host_as::<CinderDomHost>()
     {
-        let _ = h.doc.remove_child(parent_id, child_id);
+        prev_sib = h.doc.previous_sibling(child_id);
+        next_sib = h.doc.next_sibling(child_id);
+        if h.doc.remove_child(parent_id, child_id).is_ok() {
+            removed.push(child_id);
+        }
     }
-    notify_mutation(cx, parent_id, "childList", None)?;
+    if !removed.is_empty() {
+        notify_child_mutation(cx, parent_id, &[], &removed, prev_sib, next_sib)?;
+    }
     Ok(child_val)
 }
 
@@ -1460,10 +1542,27 @@ fn el_insert_before(
         return Ok(new_val);
     };
     let ref_id = args.get(1).copied().and_then(|v| unwrap_node(cx, v));
+    let mut added = Vec::new();
+    let mut prev_sib = None;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        let _ = h.doc.insert_before(parent_id, new_id, ref_id);
+        prev_sib = match ref_id {
+            Some(rid) => h.doc.previous_sibling(rid),
+            None => h.doc.last_child(parent_id),
+        };
+        if h.doc.get(new_id).data().tag() == Some("anvil-fragment") {
+            let kids: Vec<NodeId> = h.doc.children(new_id).to_vec();
+            for k in kids {
+                let _ = h.doc.insert_before(parent_id, k, ref_id);
+                added.push(k);
+            }
+        } else {
+            let _ = h.doc.insert_before(parent_id, new_id, ref_id);
+            added.push(new_id);
+        }
     }
-    notify_mutation(cx, parent_id, "childList", None)?;
+    if !added.is_empty() {
+        notify_child_mutation(cx, parent_id, &added, &[], prev_sib, ref_id)?;
+    }
     Ok(new_val)
 }
 
@@ -1477,12 +1576,23 @@ fn el_replace_child(
     };
     let new_val = args.first().copied().unwrap_or(JsValue::NULL);
     let old_val = args.get(1).copied().unwrap_or(JsValue::NULL);
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut prev_sib = None;
+    let mut next_sib = None;
     if let (Some(new_id), Some(old_id)) = (unwrap_node(cx, new_val), unwrap_node(cx, old_val))
         && let Some(h) = cx.host_as::<CinderDomHost>()
     {
-        let _ = h.doc.replace_child(parent_id, new_id, old_id);
+        prev_sib = h.doc.previous_sibling(old_id);
+        next_sib = h.doc.next_sibling(old_id);
+        if h.doc.replace_child(parent_id, new_id, old_id).is_ok() {
+            added.push(new_id);
+            removed.push(old_id);
+        }
     }
-    notify_mutation(cx, parent_id, "childList", None)?;
+    if !added.is_empty() || !removed.is_empty() {
+        notify_child_mutation(cx, parent_id, &added, &removed, prev_sib, next_sib)?;
+    }
     Ok(old_val)
 }
 
@@ -1508,14 +1618,17 @@ fn el_remove(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let parent = cx
-        .host_as::<CinderDomHost>()
-        .and_then(|h| h.doc.get(nid).parent());
+    let mut parent = None;
+    let mut prev_sib = None;
+    let mut next_sib = None;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        parent = h.doc.get(nid).parent();
+        prev_sib = h.doc.previous_sibling(nid);
+        next_sib = h.doc.next_sibling(nid);
         h.doc.remove_node(nid);
     }
     if let Some(p) = parent {
-        notify_mutation(cx, p, "childList", None)?;
+        notify_child_mutation(cx, p, &[], &[nid], prev_sib, next_sib)?;
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -1624,8 +1737,25 @@ fn el_insert_adjacent_html(
     };
     let pos = arg_str(cx, args, 0)?;
     let html = arg_str(cx, args, 1)?;
+    let mut target_parent = nid;
+    let mut added = Vec::new();
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let p_norm = pos.trim().to_ascii_lowercase();
+        target_parent = if matches!(p_norm.as_str(), "beforebegin" | "afterend") {
+            h.doc.get(nid).parent().unwrap_or(nid)
+        } else {
+            nid
+        };
+        let before: Vec<NodeId> = h.doc.children(target_parent).to_vec();
         h.doc.insert_adjacent_html(nid, &pos, &html);
+        for &cid in h.doc.children(target_parent) {
+            if !before.contains(&cid) && h.doc.shadow_host(cid).is_none() {
+                added.push(cid);
+            }
+        }
+    }
+    if !added.is_empty() {
+        notify_child_mutation(cx, target_parent, &added, &[], None, None)?;
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -1640,8 +1770,25 @@ fn el_insert_adjacent_text(
     };
     let pos = arg_str(cx, args, 0)?;
     let text = arg_str(cx, args, 1)?;
+    let mut target_parent = nid;
+    let mut added = Vec::new();
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let p_norm = pos.trim().to_ascii_lowercase();
+        target_parent = if matches!(p_norm.as_str(), "beforebegin" | "afterend") {
+            h.doc.get(nid).parent().unwrap_or(nid)
+        } else {
+            nid
+        };
+        let before: Vec<NodeId> = h.doc.children(target_parent).to_vec();
         h.doc.insert_adjacent_text(nid, &pos, &text);
+        for &cid in h.doc.children(target_parent) {
+            if !before.contains(&cid) && h.doc.shadow_host(cid).is_none() {
+                added.push(cid);
+            }
+        }
+    }
+    if !added.is_empty() {
+        notify_child_mutation(cx, target_parent, &added, &[], None, None)?;
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -1658,9 +1805,19 @@ fn el_insert_adjacent_element(
     let Some(new_el) = args.get(1).copied().and_then(|v| unwrap_node(cx, v)) else {
         return Ok(JsValue::NULL);
     };
-    let inserted = cx
-        .host_as::<CinderDomHost>()
-        .and_then(|h| h.doc.insert_adjacent_element(nid, &pos, new_el));
+    let mut target_parent = nid;
+    let inserted = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let p_norm = pos.trim().to_ascii_lowercase();
+        target_parent = if matches!(p_norm.as_str(), "beforebegin" | "afterend") {
+            h.doc.get(nid).parent().unwrap_or(nid)
+        } else {
+            nid
+        };
+        h.doc.insert_adjacent_element(nid, &pos, new_el)
+    });
+    if let Some(ins_id) = inserted {
+        notify_child_mutation(cx, target_parent, &[ins_id], &[], None, None)?;
+    }
     wrap_optional_node(cx, inserted)
 }
 
@@ -1706,15 +1863,154 @@ fn el_contains(
 fn el_attach_shadow(
     cx: &mut NativeCx<'_>,
     this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let mut open = true;
+    if let Some(init_obj) = args.first().copied().and_then(|v| v.as_object())
+        && let Ok(key) = cx.heap().key_from_str("mode")
+        && let Ok(Some(prop)) = cx.heap().get_own(init_obj, key)
+        && let Some(val) = prop.slot.data()
+        && let Ok(mode_str) = cx.to_display_string(val)
+        && mode_str.trim().eq_ignore_ascii_case("closed")
+    {
+        open = false;
+    }
+    let sr = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.attach_shadow(nid, open));
+    wrap_optional_node(cx, sr)
+}
+
+fn el_assigned_nodes(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return wrap_node_list(cx, Vec::new());
+    };
+    let mut flatten = false;
+    if let Some(opts_obj) = args.first().copied().and_then(|v| v.as_object())
+        && let Ok(key) = cx.heap().key_from_str("flatten")
+        && let Ok(Some(prop)) = cx.heap().get_own(opts_obj, key)
+        && let Some(val) = prop.slot.data()
+    {
+        flatten = val.as_bool() == Some(true);
+    }
+    let assigned = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.assigned_nodes(nid, flatten))
+        .unwrap_or_default();
+    wrap_node_list(cx, assigned)
+}
+
+fn el_assigned_elements(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return wrap_node_list(cx, Vec::new());
+    };
+    let mut flatten = false;
+    if let Some(opts_obj) = args.first().copied().and_then(|v| v.as_object())
+        && let Ok(key) = cx.heap().key_from_str("flatten")
+        && let Ok(Some(prop)) = cx.heap().get_own(opts_obj, key)
+        && let Some(val) = prop.slot.data()
+    {
+        flatten = val.as_bool() == Some(true);
+    }
+    let assigned = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.assigned_elements(nid, flatten))
+        .unwrap_or_default();
+    wrap_node_list(cx, assigned)
+}
+
+fn el_get_slot(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().string("");
+    };
+    let s = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("slot").map(str::to_string))
+        .unwrap_or_default();
+    cx.vm().string(&s)
+}
+
+fn el_set_slot(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let val = arg_str(cx, args, 0)?;
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr("slot").map(str::to_string);
+        h.doc.set_attribute(nid, "slot", &val);
+        prev
+    });
+    notify_attr_mutation(cx, nid, "slot", old_val, Some(val))?;
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_assigned_slot(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::NULL);
     };
-    let sr = cx
+    let slot_id = cx
         .host_as::<CinderDomHost>()
-        .map(|h| h.doc.attach_shadow(nid, true));
-    wrap_optional_node(cx, sr)
+        .and_then(|h| h.doc.assigned_slot(nid));
+    wrap_optional_node(cx, slot_id)
+}
+
+fn el_get_shadow_host(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let host_id = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.shadow_host(nid));
+    wrap_optional_node(cx, host_id)
+}
+
+fn el_get_shadow_mode(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let mode = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let host_id = h.doc.shadow_host(nid)?;
+        if h.doc.shadow_root(host_id) == Some(nid) {
+            Some("open")
+        } else {
+            Some("closed")
+        }
+    });
+    match mode {
+        Some(m) => cx.vm().string(m),
+        None => Ok(JsValue::UNDEFINED),
+    }
 }
 
 fn el_add_event_listener(
@@ -2619,11 +2915,164 @@ fn window_unregister_mutation_observer(
     Ok(JsValue::UNDEFINED)
 }
 
-fn notify_mutation(
+fn notify_attr_mutation(
     cx: &mut NativeCx<'_>,
     target: NodeId,
-    mutation_type: &str,
-    attr_name: Option<&str>,
+    attr_name: &str,
+    old_val: Option<String>,
+    new_val: Option<String>,
+) -> Result<(), RunError> {
+    let (matching, has_ce): (Vec<Persistent>, bool) = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            let m = h
+                .mutation_observers
+                .iter()
+                .filter(|(_, obs_nid)| h.doc.contains_node(*obs_nid, target))
+                .map(|(pers, _)| *pers)
+                .collect();
+            (m, h.has_custom_elements)
+        })
+        .unwrap_or_default();
+    if matching.is_empty() && !has_ce {
+        return Ok(());
+    }
+    let target_val = wrap_node(cx, target)?;
+    cx.keep(target_val);
+    if !matching.is_empty() {
+        let rec = cx.vm().new_plain_object()?;
+        let mtype_val = cx.vm().string("attributes")?;
+        cx.vm().define_data(rec, "type", mtype_val)?;
+        cx.vm().define_data(rec, "target", target_val)?;
+        let empty_added = cx.vm().new_array_from(&[])?;
+        cx.keep(empty_added);
+        let empty_removed = cx.vm().new_array_from(&[])?;
+        cx.keep(empty_removed);
+        cx.vm().define_data(rec, "addedNodes", empty_added)?;
+        cx.vm().define_data(rec, "removedNodes", empty_removed)?;
+        cx.vm().define_data(rec, "previousSibling", JsValue::NULL)?;
+        cx.vm().define_data(rec, "nextSibling", JsValue::NULL)?;
+        let attr_val = cx.vm().string(attr_name)?;
+        cx.vm().define_data(rec, "attributeName", attr_val)?;
+        cx.vm()
+            .define_data(rec, "attributeNamespace", JsValue::NULL)?;
+        let old_js = match old_val.as_deref() {
+            Some(s) => cx.vm().string(s)?,
+            None => JsValue::NULL,
+        };
+        cx.vm().define_data(rec, "oldValue", old_js)?;
+        let rec_val = JsValue::object(rec);
+        cx.keep(rec_val);
+        for pers in matching {
+            if let Ok(cb_val) = cx.heap().persistent(pers) {
+                let _ = cx.call(cb_val, JsValue::UNDEFINED, &[rec_val]);
+            }
+        }
+    }
+    if has_ce {
+        let g = cx.vm().global();
+        if let Ok(key) = cx.heap().key_from_str("__onCustomElementAttributeChanged")
+            && let Ok(Some(prop)) = cx.heap().get_own(g, key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let name_js = cx.vm().string(attr_name)?;
+            cx.keep(name_js);
+            let old_js = match old_val.as_deref() {
+                Some(s) => cx.vm().string(s)?,
+                None => JsValue::NULL,
+            };
+            cx.keep(old_js);
+            let new_js = match new_val.as_deref() {
+                Some(s) => cx.vm().string(s)?,
+                None => JsValue::NULL,
+            };
+            cx.keep(new_js);
+            let _ = cx.call(
+                fn_val,
+                JsValue::object(g),
+                &[target_val, name_js, old_js, new_js],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn notify_child_mutation(
+    cx: &mut NativeCx<'_>,
+    target: NodeId,
+    added: &[NodeId],
+    removed: &[NodeId],
+    prev_sib: Option<NodeId>,
+    next_sib: Option<NodeId>,
+) -> Result<(), RunError> {
+    let (matching, has_ce): (Vec<Persistent>, bool) = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            let m = h
+                .mutation_observers
+                .iter()
+                .filter(|(_, obs_nid)| h.doc.contains_node(*obs_nid, target))
+                .map(|(pers, _)| *pers)
+                .collect();
+            (m, h.has_custom_elements)
+        })
+        .unwrap_or_default();
+    if matching.is_empty() && !has_ce {
+        return Ok(());
+    }
+    let target_val = wrap_node(cx, target)?;
+    cx.keep(target_val);
+    let added_arr = wrap_node_list(cx, added.to_vec())?;
+    cx.keep(added_arr);
+    let removed_arr = wrap_node_list(cx, removed.to_vec())?;
+    cx.keep(removed_arr);
+    if !matching.is_empty() {
+        let prev_val = wrap_optional_node(cx, prev_sib)?;
+        cx.keep(prev_val);
+        let next_val = wrap_optional_node(cx, next_sib)?;
+        cx.keep(next_val);
+        let rec = cx.vm().new_plain_object()?;
+        let mtype_val = cx.vm().string("childList")?;
+        cx.vm().define_data(rec, "type", mtype_val)?;
+        cx.vm().define_data(rec, "target", target_val)?;
+        cx.vm().define_data(rec, "addedNodes", added_arr)?;
+        cx.vm().define_data(rec, "removedNodes", removed_arr)?;
+        cx.vm().define_data(rec, "previousSibling", prev_val)?;
+        cx.vm().define_data(rec, "nextSibling", next_val)?;
+        cx.vm().define_data(rec, "attributeName", JsValue::NULL)?;
+        cx.vm()
+            .define_data(rec, "attributeNamespace", JsValue::NULL)?;
+        cx.vm().define_data(rec, "oldValue", JsValue::NULL)?;
+        let rec_val = JsValue::object(rec);
+        cx.keep(rec_val);
+        for pers in matching {
+            if let Ok(cb_val) = cx.heap().persistent(pers) {
+                let _ = cx.call(cb_val, JsValue::UNDEFINED, &[rec_val]);
+            }
+        }
+    }
+    if has_ce {
+        let g = cx.vm().global();
+        if let Ok(key) = cx.heap().key_from_str("__onCustomElementChildListChanged")
+            && let Ok(Some(prop)) = cx.heap().get_own(g, key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let _ = cx.call(
+                fn_val,
+                JsValue::object(g),
+                &[target_val, added_arr, removed_arr],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn notify_char_data_mutation(
+    cx: &mut NativeCx<'_>,
+    target: NodeId,
+    old_val: Option<String>,
 ) -> Result<(), RunError> {
     let matching: Vec<Persistent> = cx
         .host_as::<CinderDomHost>()
@@ -2641,14 +3090,25 @@ fn notify_mutation(
     let target_val = wrap_node(cx, target)?;
     cx.keep(target_val);
     let rec = cx.vm().new_plain_object()?;
-    let mtype_val = cx.vm().string(mutation_type)?;
+    let mtype_val = cx.vm().string("characterData")?;
     cx.vm().define_data(rec, "type", mtype_val)?;
     cx.vm().define_data(rec, "target", target_val)?;
-    let attr_val = match attr_name {
-        Some(a) => cx.vm().string(a)?,
+    let empty_added = cx.vm().new_array_from(&[])?;
+    cx.keep(empty_added);
+    let empty_removed = cx.vm().new_array_from(&[])?;
+    cx.keep(empty_removed);
+    cx.vm().define_data(rec, "addedNodes", empty_added)?;
+    cx.vm().define_data(rec, "removedNodes", empty_removed)?;
+    cx.vm().define_data(rec, "previousSibling", JsValue::NULL)?;
+    cx.vm().define_data(rec, "nextSibling", JsValue::NULL)?;
+    cx.vm().define_data(rec, "attributeName", JsValue::NULL)?;
+    cx.vm()
+        .define_data(rec, "attributeNamespace", JsValue::NULL)?;
+    let old_js = match old_val.as_deref() {
+        Some(s) => cx.vm().string(s)?,
         None => JsValue::NULL,
     };
-    cx.vm().define_data(rec, "attributeName", attr_val)?;
+    cx.vm().define_data(rec, "oldValue", old_js)?;
     let rec_val = JsValue::object(rec);
     cx.keep(rec_val);
     for pers in matching {
@@ -2675,10 +3135,12 @@ fn el_set_id(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         return Ok(JsValue::UNDEFINED);
     };
     let val = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr("id").map(str::to_string);
         h.doc.set_attribute(nid, "id", &val);
-    }
-    notify_mutation(cx, nid, "attributes", Some("id"))?;
+        prev
+    });
+    notify_attr_mutation(cx, nid, "id", old_val, Some(val))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -2706,10 +3168,12 @@ fn el_set_class_name(
         return Ok(JsValue::UNDEFINED);
     };
     let val = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr("class").map(str::to_string);
         h.doc.set_attribute(nid, "class", &val);
-    }
-    notify_mutation(cx, nid, "attributes", Some("class"))?;
+        prev
+    });
+    notify_attr_mutation(cx, nid, "class", old_val, Some(val))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -2737,10 +3201,38 @@ fn el_set_text_content(
         return Ok(JsValue::UNDEFINED);
     };
     let text = arg_str(cx, args, 0)?;
+    let mut is_text_node = false;
+    let mut old_text = None;
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.doc.set_text_content(nid, &text);
+        if let NodeData::Text(t) = h.doc.get(nid).data() {
+            is_text_node = true;
+            old_text = Some(t.clone());
+            h.doc.set_text_content(nid, &text);
+        } else {
+            removed = h
+                .doc
+                .children(nid)
+                .iter()
+                .copied()
+                .filter(|&cid| h.doc.shadow_host(cid).is_none())
+                .collect();
+            h.doc.set_text_content(nid, &text);
+            added = h
+                .doc
+                .children(nid)
+                .iter()
+                .copied()
+                .filter(|&cid| h.doc.shadow_host(cid).is_none())
+                .collect();
+        }
     }
-    notify_mutation(cx, nid, "childList", None)?;
+    if is_text_node {
+        notify_char_data_mutation(cx, nid, old_text)?;
+    } else if !added.is_empty() || !removed.is_empty() {
+        notify_child_mutation(cx, nid, &added, &removed, None, None)?;
+    }
     Ok(JsValue::UNDEFINED)
 }
 
@@ -2784,10 +3276,28 @@ fn el_set_inner_html(
         return Ok(JsValue::UNDEFINED);
     };
     let html = arg_str(cx, args, 0)?;
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        removed = h
+            .doc
+            .children(nid)
+            .iter()
+            .copied()
+            .filter(|&cid| h.doc.shadow_host(cid).is_none())
+            .collect();
         h.doc.set_inner_html(nid, &html);
+        added = h
+            .doc
+            .children(nid)
+            .iter()
+            .copied()
+            .filter(|&cid| h.doc.shadow_host(cid).is_none())
+            .collect();
     }
-    notify_mutation(cx, nid, "childList", None)?;
+    if !added.is_empty() || !removed.is_empty() {
+        notify_child_mutation(cx, nid, &added, &removed, None, None)?;
+    }
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3103,12 +3613,19 @@ fn cl_add(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<JsVa
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
+    let old_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
     for i in 0..args.len() {
         let token = arg_str(cx, args, i)?;
         if let Some(h) = cx.host_as::<CinderDomHost>() {
             h.doc.add_class(nid, token.trim());
         }
     }
+    let new_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
+    notify_attr_mutation(cx, nid, "class", old_val, new_val)?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3116,12 +3633,19 @@ fn cl_remove(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
+    let old_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
     for i in 0..args.len() {
         let token = arg_str(cx, args, i)?;
         if let Some(h) = cx.host_as::<CinderDomHost>() {
             h.doc.remove_class(nid, token.trim());
         }
     }
+    let new_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
+    notify_attr_mutation(cx, nid, "class", old_val, new_val)?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3130,6 +3654,9 @@ fn cl_toggle(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         return Ok(JsValue::FALSE);
     };
     let token = arg_str(cx, args, 0)?;
+    let old_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
     let present = if let Some(force) = args.get(1).copied()
         && !force.is_undefined()
     {
@@ -3146,6 +3673,10 @@ fn cl_toggle(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         cx.host_as::<CinderDomHost>()
             .is_some_and(|h| h.doc.toggle_class(nid, token.trim()))
     };
+    let new_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string));
+    notify_attr_mutation(cx, nid, "class", old_val, new_val)?;
     Ok(JsValue::boolean(present))
 }
 
@@ -3185,13 +3716,20 @@ fn style_set_property(
     let raw_prop = arg_str(cx, args, 0)?;
     let css_prop = camel_to_kebab(raw_prop.trim());
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
-        if val.trim().is_empty() {
-            remove_inline_style_prop(&mut h.doc, nid, &css_prop);
-        } else {
-            update_inline_style(&mut h.doc, nid, &css_prop, val.trim());
-        }
-    }
+    let (old_val, new_val) = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            let prev = h.doc.get(nid).data().attr("style").map(str::to_string);
+            if val.trim().is_empty() {
+                remove_inline_style_prop(&mut h.doc, nid, &css_prop);
+            } else {
+                update_inline_style(&mut h.doc, nid, &css_prop, val.trim());
+            }
+            let next = h.doc.get(nid).data().attr("style").map(str::to_string);
+            (prev, next)
+        })
+        .unwrap_or((None, None));
+    notify_attr_mutation(cx, nid, "style", old_val, new_val)?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3222,14 +3760,17 @@ fn style_remove_property(
     };
     let raw_prop = arg_str(cx, args, 0)?;
     let css_prop = camel_to_kebab(raw_prop.trim());
-    let prev = cx
+    let (prev, old_attr, new_attr) = cx
         .host_as::<CinderDomHost>()
         .map(|h| {
+            let prev_attr = h.doc.get(nid).data().attr("style").map(str::to_string);
             let old = read_inline_style(&h.doc, nid, &css_prop);
             remove_inline_style_prop(&mut h.doc, nid, &css_prop);
-            old
+            let next_attr = h.doc.get(nid).data().attr("style").map(str::to_string);
+            (old, prev_attr, next_attr)
         })
         .unwrap_or_default();
+    notify_attr_mutation(cx, nid, "style", old_attr, new_attr)?;
     cx.vm().string(&prev)
 }
 
@@ -3257,9 +3798,12 @@ fn style_set_css_text(
         return Ok(JsValue::UNDEFINED);
     };
     let css = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr("style").map(str::to_string);
         h.doc.set_attribute(nid, "style", &css);
-    }
+        prev
+    });
+    notify_attr_mutation(cx, nid, "style", old_val, Some(css))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3295,9 +3839,12 @@ fn dataset_set(
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
     let attr_name = format!("data-{}", camel_to_kebab(key.trim()));
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr(&attr_name).map(str::to_string);
         h.doc.set_attribute(nid, &attr_name, &val);
-    }
+        prev
+    });
+    notify_attr_mutation(cx, nid, &attr_name, old_val, Some(val))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -3600,6 +4147,7 @@ fn custom_elements_define(
 ) -> Result<JsValue, RunError> {
     let name = arg_str(cx, args, 0)?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.has_custom_elements = true;
         h.doc.define_custom_element(&name);
     }
     Ok(JsValue::UNDEFINED)
@@ -3967,10 +4515,17 @@ fn el_set_node_value(
         return Ok(JsValue::UNDEFINED);
     };
     let text = arg_str(cx, args, 0)?;
+    let mut old_val = None;
+    let mut is_text = false;
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        if let NodeData::Text(_) = host.doc.get(nid).data() {
+        if let NodeData::Text(t) = host.doc.get(nid).data() {
+            is_text = true;
+            old_val = Some(t.clone());
             host.doc.set_text_content(nid, &text);
         }
+    }
+    if is_text {
+        notify_char_data_mutation(cx, nid, old_val)?;
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -4042,7 +4597,14 @@ fn el_get_child_nodes(
     };
     let kids: Vec<NodeId> = cx
         .host_as::<CinderDomHost>()
-        .map(|h| h.doc.children(nid).to_vec())
+        .map(|h| {
+            h.doc
+                .children(nid)
+                .iter()
+                .copied()
+                .filter(|&cid| h.doc.shadow_host(cid).is_none())
+                .collect()
+        })
         .unwrap_or_default();
     wrap_node_list(cx, kids)
 }
@@ -4055,16 +4617,10 @@ fn el_get_next_sibling(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::NULL);
     };
-    let next = cx.host_as::<CinderDomHost>().and_then(|h| {
-        let pid = h.doc.get(nid).parent()?;
-        let siblings = h.doc.children(pid);
-        let pos = siblings.iter().position(|&c| c == nid)?;
-        siblings.get(pos + 1).copied()
-    });
-    match next {
-        Some(id) => wrap_node(cx, id),
-        None => Ok(JsValue::NULL),
-    }
+    let next = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.next_sibling(nid));
+    wrap_optional_node(cx, next)
 }
 
 fn el_get_previous_sibling(
@@ -4075,20 +4631,10 @@ fn el_get_previous_sibling(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::NULL);
     };
-    let prev = cx.host_as::<CinderDomHost>().and_then(|h| {
-        let pid = h.doc.get(nid).parent()?;
-        let siblings = h.doc.children(pid);
-        let pos = siblings.iter().position(|&c| c == nid)?;
-        if pos > 0 {
-            siblings.get(pos - 1).copied()
-        } else {
-            None
-        }
-    });
-    match prev {
-        Some(id) => wrap_node(cx, id),
-        None => Ok(JsValue::NULL),
-    }
+    let prev = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.previous_sibling(nid));
+    wrap_optional_node(cx, prev)
 }
 
 fn doc_get_node_type(

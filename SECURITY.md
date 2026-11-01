@@ -10,4 +10,4 @@ Do not put the details in a public issue.
 
 The stylesheet, layout, and script limits that are really in the code are listed in `SECURITY.md` in the `anvil-browser` repository, next to the network, sandbox, and profile limits.
 
-Version 0.24.4 is current.
+Version 0.24.5 is current.

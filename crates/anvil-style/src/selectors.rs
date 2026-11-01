@@ -283,6 +283,10 @@ enum Simple {
     Has(Vec<Selector>),
     Host(Vec<Selector>),
     HostContext(Vec<Selector>),
+    /// `::slotted(<compound-selector-list>)` matching slotted light-DOM children.
+    Slotted(Vec<Selector>),
+    /// `::part(<ident>+)` matching shadow tree elements with `part="..."`.
+    Part(Vec<String>),
     /// Language ranges from `:lang()`, as written.
     Lang(Vec<String>),
     /// `:dir()`. `None` for a direction other than `ltr` or `rtl`.
@@ -302,13 +306,18 @@ impl Simple {
             | Simple::Id(_)
             | Simple::Class(_)
             | Simple::PseudoElement(_) => 0,
-            Simple::Attr(_) | Simple::State(_) | Simple::Nth(_) | Simple::Dir(_) => 1,
+            Simple::Attr(_)
+            | Simple::State(_)
+            | Simple::Nth(_)
+            | Simple::Dir(_)
+            | Simple::Part(_) => 1,
             Simple::Lang(_)
             | Simple::Is(_)
             | Simple::Where(_)
             | Simple::Not(_)
             | Simple::Host(_)
-            | Simple::HostContext(_) => 2,
+            | Simple::HostContext(_)
+            | Simple::Slotted(_) => 2,
             Simple::Has(_) => 3,
         }
     }
@@ -928,14 +937,39 @@ fn parse_compound(cur: &mut Cursor, cx: Ctx) -> Parsed<Compound> {
                     if !known || cx.nested {
                         return Err(Fail::Invalid);
                     }
-                    let pseudo_kind = if arg.is_none() && name == "before" {
-                        Some(false)
-                    } else if arg.is_none() && name == "after" {
-                        Some(true)
+                    if element && name == "slotted" {
+                        if let Some(arg) = arg {
+                            match parse_list(arg, cx.inner()?, false) {
+                                Ok(list) => parts.push(Simple::Slotted(list)),
+                                Err(Fail::TooBig) => return Err(Fail::TooBig),
+                                Err(Fail::Invalid) => parts.push(Simple::PseudoElement(None)),
+                            }
+                        } else {
+                            parts.push(Simple::PseudoElement(None));
+                        }
+                    } else if element && name == "part" {
+                        if let Some(arg) = arg {
+                            let s: String = arg.iter().collect();
+                            let tokens: Vec<String> =
+                                s.split_whitespace().map(|t| t.to_string()).collect();
+                            if tokens.is_empty() {
+                                parts.push(Simple::PseudoElement(None));
+                            } else {
+                                parts.push(Simple::Part(tokens));
+                            }
+                        } else {
+                            parts.push(Simple::PseudoElement(None));
+                        }
                     } else {
-                        None
-                    };
-                    parts.push(Simple::PseudoElement(pseudo_kind));
+                        let pseudo_kind = if arg.is_none() && name == "before" {
+                            Some(false)
+                        } else if arg.is_none() && name == "after" {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        parts.push(Simple::PseudoElement(pseudo_kind));
+                    }
                     after_pseudo_element = true;
                 } else {
                     let part = match arg {
@@ -953,14 +987,21 @@ fn parse_compound(cur: &mut Cursor, cx: Ctx) -> Parsed<Compound> {
         return Err(Fail::Invalid);
     }
     parts.sort_by_key(Simple::cost);
-    let bits = parts.iter().fold(0, |bits, part| {
-        bits | match part {
-            Simple::Type(name) => name_bit(b't', name),
-            Simple::Id(id) => name_bit(b'#', id),
-            Simple::Class(class) => name_bit(b'.', class),
-            _ => 0,
-        }
-    });
+    let has_shadow_pseudo = parts
+        .iter()
+        .any(|p| matches!(p, Simple::Slotted(_) | Simple::Part(_)));
+    let bits = if has_shadow_pseudo {
+        0
+    } else {
+        parts.iter().fold(0, |bits, part| {
+            bits | match part {
+                Simple::Type(name) => name_bit(b't', name),
+                Simple::Id(id) => name_bit(b'#', id),
+                Simple::Class(class) => name_bit(b'.', class),
+                _ => 0,
+            }
+        })
+    };
     Ok(Compound { parts, bits })
 }
 
@@ -1261,6 +1302,8 @@ fn simple_specificity(part: &Simple) -> Spec {
             nth.of.as_deref().map(max_specificity).unwrap_or((0, 0, 0)),
         ),
         Simple::Host(list) | Simple::HostContext(list) => add((0, 1, 0), max_specificity(list)),
+        Simple::Slotted(list) => add((0, 0, 1), max_specificity(list)),
+        Simple::Part(_) => (0, 0, 1),
         Simple::Is(list) | Simple::Not(list) | Simple::Has(list) => max_specificity(list),
         Simple::Where(_) => (0, 0, 0),
     }
@@ -1302,6 +1345,29 @@ impl Selector {
             }
         }
         target.flatten()
+    }
+
+    pub(crate) fn has_part(&self) -> bool {
+        self.compounds
+            .iter()
+            .any(|c| c.parts.iter().any(|p| matches!(p, Simple::Part(_))))
+    }
+
+    pub(crate) fn has_slotted(&self) -> bool {
+        self.compounds
+            .iter()
+            .any(|c| c.parts.iter().any(|p| matches!(p, Simple::Slotted(_))))
+    }
+
+    pub(crate) fn has_host(&self) -> bool {
+        self.compounds.iter().any(|c| {
+            c.parts.iter().any(|p| {
+                matches!(
+                    p,
+                    Simple::Host(_) | Simple::HostContext(_) | Simple::State(State::Host)
+                )
+            })
+        })
     }
 
     fn last(&self) -> usize {
@@ -1776,9 +1842,21 @@ impl<'d> Matcher<'d> {
         let Some(compound) = sel.compounds.get(idx) else {
             return Outcome::Nowhere;
         };
-        if !self.compound(compound, n) {
-            return Outcome::TryNext;
-        }
+        let n = if compound
+            .parts
+            .iter()
+            .any(|p| matches!(p, Simple::Slotted(_) | Simple::Part(_)))
+        {
+            let Some(mapped_n) = self.compound_shadow_pseudo(compound, n) else {
+                return Outcome::TryNext;
+            };
+            mapped_n
+        } else {
+            if !self.compound(compound, n) {
+                return Outcome::TryNext;
+            }
+            n
+        };
         if idx == 0 {
             return match sel.leading {
                 None => Outcome::Matched,
@@ -1924,10 +2002,81 @@ impl<'d> Matcher<'d> {
         true
     }
 
+    fn compound_shadow_pseudo(&self, compound: &Compound, n: u32) -> Option<u32> {
+        let data_n = self.data(n);
+        let tag_n = data_n.tag()?;
+        let nid = Self::node_id(n);
+        let mut target_n = n;
+        for part in &compound.parts {
+            match part {
+                Simple::Slotted(list) => {
+                    let slot_id = self.doc.assigned_slot(nid)?;
+                    if !self.any_matches(list, n) {
+                        return None;
+                    }
+                    target_n = slot_id.index() as u32;
+                }
+                Simple::Part(tokens) => {
+                    let host_id = self.doc.enclosing_shadow_host(nid)?;
+                    if host_id == nid {
+                        return None;
+                    }
+                    let part_attr = data_n.attr("part")?;
+                    if !tokens
+                        .iter()
+                        .all(|w| part_attr.split_whitespace().any(|t| t == w))
+                    {
+                        return None;
+                    }
+                    target_n = host_id.index() as u32;
+                }
+                _ => {}
+            }
+        }
+        let data_t = self.data(target_n);
+        let tag_t = data_t.tag()?;
+        for part in &compound.parts {
+            match part {
+                Simple::Slotted(_) | Simple::Part(_) => continue,
+                Simple::Type(name) => {
+                    if tag_t != name {
+                        return None;
+                    }
+                }
+                Simple::Class(class) => {
+                    if !data_t.has_class(class) {
+                        return None;
+                    }
+                }
+                Simple::Id(id) => {
+                    if data_t.id() != Some(id.as_str()) {
+                        return None;
+                    }
+                }
+                Simple::State(_) => {
+                    if !self.simple(part, target_n, data_t, tag_t)
+                        && !self.simple(part, n, data_n, tag_n)
+                    {
+                        return None;
+                    }
+                }
+                _ => {
+                    if !self.simple(part, target_n, data_t, tag_t) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(target_n)
+    }
+
     fn simple(&self, part: &Simple, n: u32, data: &NodeData, tag: &str) -> bool {
         match part {
             Simple::Type(name) => tag == name,
-            Simple::Unresolved { .. } | Simple::PseudoElement(_) => false,
+            Simple::Unresolved { .. }
+            | Simple::PseudoElement(_)
+            | Simple::Slotted(_)
+            | Simple::Part(_) => false,
             Simple::Id(id) => data.id() == Some(id.as_str()),
             Simple::Class(class) => data.has_class(class),
             Simple::Attr(attr) => attr_matches(attr, data),

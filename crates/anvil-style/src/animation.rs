@@ -1587,6 +1587,35 @@ impl Animator {
         self.nodes.retain(|_, state| state.seen == pass);
     }
 
+    /// Seed `id` with `existing_base` if `id` has not been tracked by this animator yet.
+    pub(crate) fn seed_if_absent(&mut self, id: NodeId, existing_base: &ComputedStyle) {
+        let pass = self.pass;
+        self.nodes.entry(id).or_insert_with(|| NodeState {
+            base: *existing_base,
+            transitions: Vec::new(),
+            animations: Vec::new(),
+            seen: pass,
+        });
+    }
+
+    /// Nodes that currently have a live transition or keyframe animation at `now_ms`.
+    pub(crate) fn active_nodes(&self) -> Vec<NodeId> {
+        let now = self.now_ms;
+        let mut out: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, state)| {
+                state.transitions.iter().any(|t| !t.is_done(now))
+                    || state.animations.iter().any(|(spec, start, has_rule)| {
+                        *has_rule && animation_is_live(spec, now - start - f64::from(spec.delay_ms))
+                    })
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        out.sort_by_key(|id| id.index());
+        out
+    }
+
     /// Note `base`, the element's freshly cascaded style, start transitions
     /// for properties that changed since the last pass, and write running
     /// values onto `out`, the style the page will use.

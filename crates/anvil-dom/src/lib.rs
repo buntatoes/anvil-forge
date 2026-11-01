@@ -255,6 +255,21 @@ pub struct CanvasSurface {
     pub rgba: Vec<u8>,
 }
 
+/// Tracks style-invalidated nodes and mutation generation without affecting structural `Document` equality.
+#[derive(Clone, Debug, Default)]
+struct DirtyTracker {
+    nodes: Vec<NodeId>,
+    generation: u64,
+}
+
+impl PartialEq for DirtyTracker {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DirtyTracker {}
+
 /// A document and every node it owns.
 ///
 /// Slots are append-only. [`Self::remove_node`], [`Self::set_text_content`],
@@ -279,6 +294,7 @@ pub struct Document {
     adopted_styles: Vec<String>,
     scroll_offsets: std::collections::HashMap<NodeId, (u32, u32)>,
     custom_validity: std::collections::HashMap<NodeId, String>,
+    dirty: DirtyTracker,
 }
 
 impl Default for Document {
@@ -334,6 +350,7 @@ impl Document {
             adopted_styles: Vec::new(),
             scroll_offsets: std::collections::HashMap::new(),
             custom_validity: std::collections::HashMap::new(),
+            dirty: DirtyTracker::default(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -345,7 +362,44 @@ impl Document {
         doc.html = html;
         doc.head = head;
         doc.body = body;
+        doc.clear_dirty_styles();
         doc
+    }
+
+    /// Mark `id` (and its subtree) as needing incremental style recomputation.
+    pub fn mark_style_dirty(&mut self, id: NodeId) {
+        if self.nodes.get(id.index()).is_none() {
+            return;
+        }
+        self.dirty.generation = self.dirty.generation.wrapping_add(1);
+        if !self.dirty.nodes.contains(&id) {
+            self.dirty.nodes.push(id);
+        }
+    }
+
+    /// True when one or more DOM nodes have pending style invalidations.
+    pub fn has_dirty_styles(&self) -> bool {
+        !self.dirty.nodes.is_empty()
+    }
+
+    /// Borrow the list of nodes marked style-dirty since the last clear/take.
+    pub fn dirty_style_nodes(&self) -> &[NodeId] {
+        &self.dirty.nodes
+    }
+
+    /// Drain and return all nodes marked style-dirty since the last pass.
+    pub fn take_dirty_style_nodes(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.dirty.nodes)
+    }
+
+    /// Clear all pending style-dirty markers without returning them.
+    pub fn clear_dirty_styles(&mut self) {
+        self.dirty.nodes.clear();
+    }
+
+    /// Monotonically increasing counter incremented on each DOM or state mutation.
+    pub fn mutation_generation(&self) -> u64 {
+        self.dirty.generation
     }
 
     /// Attach a Shadow DOM root to `host` (`open` = true for `mode: "open"`).
@@ -358,7 +412,184 @@ impl Document {
         let _ = self.append(host, sr);
         self.shadow_roots.insert(host, (sr, open));
         self.shadow_hosts.insert(sr, host);
+        self.mark_style_dirty(host);
         sr
+    }
+
+    /// All `(host, shadow_root, is_open)` entries sorted by host `NodeId`.
+    pub fn shadow_root_entries(&self) -> Vec<(NodeId, NodeId, bool)> {
+        let mut list: Vec<(NodeId, NodeId, bool)> = self
+            .shadow_roots
+            .iter()
+            .map(|(&host, &(sr, open))| (host, sr, open))
+            .collect();
+        list.sort_by_key(|(h, _, _)| h.index());
+        list
+    }
+
+    /// Concatenated text of `<style>` elements inside `shadow_root` in tree order.
+    pub fn shadow_css(&self, shadow_root: NodeId) -> String {
+        if self.nodes.get(shadow_root.index()).is_none() {
+            return String::new();
+        }
+        let mut blocks = Vec::new();
+        self.collect_style(shadow_root, &mut blocks);
+        blocks.join("\n")
+    }
+
+    /// Light-DOM nodes distributed to `<slot>` element `slot_id`.
+    ///
+    /// When `flatten` is `true` and no light-DOM nodes match `slot_id`, returns
+    /// `slot_id`'s own fallback children (expanding nested `<slot>` elements).
+    pub fn assigned_nodes(&self, slot_id: NodeId, flatten: bool) -> Vec<NodeId> {
+        if self.nodes.get(slot_id.index()).and_then(|n| n.data().tag()) != Some("slot") {
+            return Vec::new();
+        }
+        let Some(host) = self.enclosing_shadow_host(slot_id) else {
+            return if flatten {
+                self.children(slot_id).to_vec()
+            } else {
+                Vec::new()
+            };
+        };
+        let Some(&(sr, _)) = self.shadow_roots.get(&host) else {
+            return Vec::new();
+        };
+        let slot_name = self
+            .get(slot_id)
+            .data()
+            .attr("name")
+            .map(str::trim)
+            .unwrap_or("");
+        // Only the first `<slot>` with `slot_name` in `sr` receives the matching light-DOM nodes.
+        if self.find_slot_by_name(sr, slot_name) != Some(slot_id) {
+            return if flatten {
+                self.children(slot_id).to_vec()
+            } else {
+                Vec::new()
+            };
+        }
+        let mut assigned = Vec::new();
+        for &child in self.children(host) {
+            if child == sr {
+                continue;
+            }
+            let data = self.get(child).data();
+            if let NodeData::Text(t) = data
+                && t.trim().is_empty()
+            {
+                continue;
+            }
+            let child_slot = data.attr("slot").map(str::trim).unwrap_or("");
+            if child_slot == slot_name {
+                if flatten && data.tag() == Some("slot") {
+                    assigned.extend(self.assigned_nodes(child, true));
+                } else {
+                    assigned.push(child);
+                }
+            }
+        }
+        if !assigned.is_empty() {
+            assigned
+        } else if flatten {
+            self.children(slot_id).to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Element nodes distributed to `<slot>` element `slot_id`.
+    pub fn assigned_elements(&self, slot_id: NodeId, flatten: bool) -> Vec<NodeId> {
+        self.assigned_nodes(slot_id, flatten)
+            .into_iter()
+            .filter(|&id| self.get(id).data().tag().is_some())
+            .collect()
+    }
+
+    /// The `<slot>` inside the parent shadow root to which `light_child` is assigned, if any.
+    pub fn assigned_slot(&self, light_child: NodeId) -> Option<NodeId> {
+        let host = self.nodes.get(light_child.index())?.parent?;
+        let &(sr, _) = self.shadow_roots.get(&host)?;
+        if light_child == sr {
+            return None;
+        }
+        let data = self.get(light_child).data();
+        if let NodeData::Text(t) = data
+            && t.trim().is_empty()
+        {
+            return None;
+        }
+        let slot_name = data.attr("slot").map(str::trim).unwrap_or("");
+        self.find_slot_by_name(sr, slot_name)
+    }
+
+    /// True when `id` is a light-DOM child assigned to a `<slot>` in its parent's shadow root (`::slotted`).
+    pub fn is_slotted_node(&self, id: NodeId) -> bool {
+        self.assigned_slot(id).is_some()
+    }
+
+    fn find_slot_by_name(&self, root: NodeId, target_name: &str) -> Option<NodeId> {
+        let data = self.get(root).data();
+        if data.tag() == Some("slot") {
+            let name = data.attr("name").map(str::trim).unwrap_or("");
+            if name == target_name {
+                return Some(root);
+            }
+        }
+        for &child in self.children(root) {
+            if let Some(found) = self.find_slot_by_name(child, target_name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Composed children of `id` for layout and painting.
+    ///
+    /// - When the document has no shadow roots, borrows `self.children(id)` with zero allocation.
+    /// - When `id` is a shadow host, returns the composed children of its shadow root (distributing
+    ///   light-DOM children into `<slot>` elements and hiding unslotted light-DOM children).
+    /// - When `id` is inside a shadow tree and contains `<slot>` children, splices each `<slot>`'s
+    ///   assigned light-DOM nodes (or fallback children) inline.
+    pub fn composed_children(&self, id: NodeId) -> std::borrow::Cow<'_, [NodeId]> {
+        if self.shadow_roots.is_empty() {
+            return std::borrow::Cow::Borrowed(self.children(id));
+        }
+        if let Some(&(sr, _)) = self.shadow_roots.get(&id) {
+            let mut out = Vec::new();
+            self.expand_composed_children_into(sr, &mut out);
+            return std::borrow::Cow::Owned(out);
+        }
+        if self.get(id).data().tag() == Some("slot") && self.enclosing_shadow_host(id).is_some() {
+            return std::borrow::Cow::Owned(self.assigned_nodes(id, true));
+        }
+        let raw = self.children(id);
+        if raw
+            .iter()
+            .any(|&c| self.get(c).data().tag() == Some("slot"))
+            && self.enclosing_shadow_host(id).is_some()
+        {
+            let mut out = Vec::with_capacity(raw.len());
+            self.expand_composed_children_into(id, &mut out);
+            return std::borrow::Cow::Owned(out);
+        }
+        std::borrow::Cow::Borrowed(raw)
+    }
+
+    fn expand_composed_children_into(&self, container: NodeId, out: &mut Vec<NodeId>) {
+        for &child in self.children(container) {
+            if self.get(child).data().tag() == Some("slot") {
+                for slotted in self.assigned_nodes(child, true) {
+                    if self.get(slotted).data().tag() == Some("slot") {
+                        self.expand_composed_children_into(slotted, out);
+                    } else {
+                        out.push(slotted);
+                    }
+                }
+            } else {
+                out.push(child);
+            }
+        }
     }
 
     /// Open shadow root attached to `host`, or `None` if none or closed.
@@ -385,18 +616,15 @@ impl Document {
 
     /// Enclosing shadow host for `node` (if `node` is inside a shadow tree or is a shadow host).
     pub fn enclosing_shadow_host(&self, node: NodeId) -> Option<NodeId> {
-        if self.shadow_roots.contains_key(&node) {
-            return Some(node);
-        }
         let mut cursor = Some(node);
         while let Some(curr) = cursor {
             if let Some(&host) = self.shadow_hosts.get(&curr) {
                 return Some(host);
             }
-            if self.shadow_roots.contains_key(&curr) {
-                return Some(curr);
-            }
             cursor = self.nodes.get(curr.index()).and_then(|n| n.parent);
+        }
+        if self.shadow_roots.contains_key(&node) {
+            return Some(node);
         }
         None
     }
@@ -422,7 +650,16 @@ impl Document {
 
     /// Update the currently hovered node id.
     pub fn set_hovered_node(&mut self, id: Option<NodeId>) {
+        let prev = self.hovered_node;
         self.hovered_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+        if prev != self.hovered_node {
+            if let Some(p) = prev {
+                self.mark_style_dirty(p);
+            }
+            if let Some(n) = self.hovered_node {
+                self.mark_style_dirty(n);
+            }
+        }
     }
 
     /// True when `id` is the hovered node or an element ancestor of the hovered node (`:hover`).
@@ -437,7 +674,16 @@ impl Document {
 
     /// Update the currently active (pressed) node id.
     pub fn set_active_node(&mut self, id: Option<NodeId>) {
+        let prev = self.active_node;
         self.active_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+        if prev != self.active_node {
+            if let Some(p) = prev {
+                self.mark_style_dirty(p);
+            }
+            if let Some(n) = self.active_node {
+                self.mark_style_dirty(n);
+            }
+        }
     }
 
     /// True when `id` is the active node or an element ancestor of the active node (`:active`).
@@ -452,7 +698,16 @@ impl Document {
 
     /// Update the currently focused node id.
     pub fn set_focused_node(&mut self, id: Option<NodeId>) {
+        let prev = self.focused_node;
         self.focused_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+        if prev != self.focused_node {
+            if let Some(p) = prev {
+                self.mark_style_dirty(p);
+            }
+            if let Some(n) = self.focused_node {
+                self.mark_style_dirty(n);
+            }
+        }
     }
 
     /// True when `id` is the currently focused node (`:focus`, `:focus-visible`).
@@ -472,10 +727,14 @@ impl Document {
 
     /// Set the URL fragment target identifier (`#fragment` or `fragment`).
     pub fn set_target_fragment(&mut self, fragment: Option<&str>) {
-        self.target_fragment = fragment
+        let next = fragment
             .map(|s| s.trim().trim_start_matches('#').trim())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        if self.target_fragment != next {
+            self.target_fragment = next;
+            self.mark_style_dirty(self.root());
+        }
     }
 
     /// True when `id` matches the active URL fragment target (`:target`).
@@ -1271,20 +1530,27 @@ impl Document {
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.set_attr(name, value);
+            self.mark_style_dirty(id);
         }
     }
 
     /// Remove one attribute. False when `id` is missing or the attribute was absent.
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
-        self.nodes
+        let removed = self
+            .nodes
             .get_mut(id.index())
-            .is_some_and(|node| node.data.remove_attr(name))
+            .is_some_and(|node| node.data.remove_attr(name));
+        if removed {
+            self.mark_style_dirty(id);
+        }
+        removed
     }
 
     /// Add a class token on `id`. No-op when `id` is missing or not an element.
     pub fn add_class(&mut self, id: NodeId, class_name: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.add_class(class_name);
+            self.mark_style_dirty(id);
         }
     }
 
@@ -1292,15 +1558,19 @@ impl Document {
     pub fn remove_class(&mut self, id: NodeId, class_name: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.remove_class(class_name);
+            self.mark_style_dirty(id);
         }
     }
 
     /// Toggle a class on `id`. False when `id` is missing, or when the class
     /// was removed. True when the class is present after the call.
     pub fn toggle_class(&mut self, id: NodeId, class_name: &str) -> bool {
-        self.nodes
-            .get_mut(id.index())
-            .is_some_and(|node| node.data.toggle_class(class_name))
+        let Some(node) = self.nodes.get_mut(id.index()) else {
+            return false;
+        };
+        let res = node.data.toggle_class(class_name);
+        self.mark_style_dirty(id);
+        res
     }
 
     /// Owned current value of a form control.
@@ -2012,6 +2282,11 @@ impl Document {
             && let NodeData::Text(slot) = &mut node.data
         {
             *slot = text.to_string();
+            let parent = node.parent;
+            if let Some(p) = parent {
+                self.mark_style_dirty(p);
+            }
+            self.mark_style_dirty(id);
             return;
         }
         if self.nodes.get(id.index()).is_none() {
@@ -2019,10 +2294,15 @@ impl Document {
         }
         let old_children = std::mem::take(&mut self.nodes[id.index()].children);
         for child in old_children {
+            if self.shadow_hosts.contains_key(&child) {
+                self.nodes[id.index()].children.push(child);
+                continue;
+            }
             if let Some(node) = self.nodes.get_mut(child.index()) {
                 node.parent = None;
             }
         }
+        self.mark_style_dirty(id);
         if !text.is_empty() {
             let text_id = self.create_text(text);
             let _ = self.append(id, text_id);
@@ -2052,6 +2332,8 @@ impl Document {
         self.detach(child);
         self.nodes[child.index()].parent = Some(parent);
         self.nodes[parent.index()].children.push(child);
+        self.mark_style_dirty(parent);
+        self.mark_style_dirty(child);
         Ok(())
     }
 
@@ -2291,6 +2573,8 @@ impl Document {
         } else {
             children.push(new_child);
         }
+        self.mark_style_dirty(parent);
+        self.mark_style_dirty(new_child);
         Ok(new_child)
     }
 
@@ -2355,12 +2639,23 @@ impl Document {
 
     /// First direct child node (element or text) of `id`.
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes.get(id.index())?.children.first().copied()
+        self.nodes
+            .get(id.index())?
+            .children
+            .iter()
+            .copied()
+            .find(|cid| !self.shadow_hosts.contains_key(cid))
     }
 
     /// Last direct child node (element or text) of `id`.
     pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes.get(id.index())?.children.last().copied()
+        self.nodes
+            .get(id.index())?
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .find(|cid| !self.shadow_hosts.contains_key(cid))
     }
 
     /// Next sibling node (element or text) of `id`.
@@ -2368,7 +2663,10 @@ impl Document {
         let parent = self.nodes.get(id.index())?.parent?;
         let siblings = &self.nodes.get(parent.index())?.children;
         let pos = siblings.iter().position(|&cid| cid == id)?;
-        siblings.get(pos + 1).copied()
+        siblings[pos + 1..]
+            .iter()
+            .copied()
+            .find(|cid| !self.shadow_hosts.contains_key(cid))
     }
 
     /// Previous sibling node (element or text) of `id`.
@@ -2376,7 +2674,11 @@ impl Document {
         let parent = self.nodes.get(id.index())?.parent?;
         let siblings = &self.nodes.get(parent.index())?.children;
         let pos = siblings.iter().position(|&cid| cid == id)?;
-        pos.checked_sub(1).and_then(|i| siblings.get(i).copied())
+        siblings[..pos]
+            .iter()
+            .rev()
+            .copied()
+            .find(|cid| !self.shadow_hosts.contains_key(cid))
     }
 
     /// All descendant elements under `scope` matching `tag_name` (case-insensitive, or `*` for all).
@@ -2555,7 +2857,9 @@ impl Document {
         node.children
             .iter()
             .copied()
-            .filter(|cid| self.get(*cid).data().tag().is_some())
+            .filter(|cid| {
+                self.get(*cid).data().tag().is_some() && !self.shadow_hosts.contains_key(cid)
+            })
             .collect()
     }
 
@@ -2574,10 +2878,9 @@ impl Document {
         let parent = self.nodes.get(id.index())?.parent?;
         let siblings = &self.nodes.get(parent.index())?.children;
         let pos = siblings.iter().position(|&cid| cid == id)?;
-        siblings[pos + 1..]
-            .iter()
-            .copied()
-            .find(|&cid| self.get(cid).data().tag().is_some())
+        siblings[pos + 1..].iter().copied().find(|&cid| {
+            self.get(cid).data().tag().is_some() && !self.shadow_hosts.contains_key(&cid)
+        })
     }
 
     /// Previous sibling of `id` that is an element.
@@ -2585,11 +2888,9 @@ impl Document {
         let parent = self.nodes.get(id.index())?.parent?;
         let siblings = &self.nodes.get(parent.index())?.children;
         let pos = siblings.iter().position(|&cid| cid == id)?;
-        siblings[..pos]
-            .iter()
-            .rev()
-            .copied()
-            .find(|&cid| self.get(cid).data().tag().is_some())
+        siblings[..pos].iter().rev().copied().find(|&cid| {
+            self.get(cid).data().tag().is_some() && !self.shadow_hosts.contains_key(&cid)
+        })
     }
 
     /// Parent of `id` if that parent is an element node.
@@ -2623,6 +2924,9 @@ impl Document {
         let kids: Vec<NodeId> = node.children.clone();
         let mut out = String::new();
         for child in kids {
+            if self.shadow_hosts.contains_key(&child) {
+                continue;
+            }
             self.write_html(child, &mut out);
         }
         out
@@ -2683,15 +2987,26 @@ impl Document {
                 }
                 b':' if bracket_depth == 0 => {
                     i += 1;
-                    if i < bytes.len() && bytes[i] == b':' {
-                        return false;
-                    }
+                    let is_double_colon = if i < bytes.len() && bytes[i] == b':' {
+                        i += 1;
+                        true
+                    } else {
+                        false
+                    };
                     let start_name = i;
                     while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
                     {
                         i += 1;
                     }
-                    let name = compound[start_name..i].to_ascii_lowercase();
+                    let raw_name = compound[start_name..i].to_ascii_lowercase();
+                    if is_double_colon && !matches!(raw_name.as_str(), "slotted" | "part") {
+                        return false;
+                    }
+                    let name = if is_double_colon {
+                        format!("::{raw_name}")
+                    } else {
+                        raw_name
+                    };
                     if i < bytes.len() && bytes[i] == b'(' {
                         i += 1;
                         let start_arg = i;
@@ -3085,6 +3400,24 @@ impl Document {
                         return false;
                     }
                 }
+                ("slotted" | "::slotted", Some(inner)) => {
+                    if !self.is_slotted_node(id) || !self.node_matches_selector(id, inner) {
+                        return false;
+                    }
+                }
+                ("part" | "::part", Some(part_arg)) => {
+                    let wanted: Vec<&str> = part_arg.split_whitespace().collect();
+                    if wanted.is_empty() || self.enclosing_shadow_host(id).is_none() {
+                        return false;
+                    }
+                    let Some(attr_val) = self.get(id).data().attr("part") else {
+                        return false;
+                    };
+                    let have: Vec<&str> = attr_val.split_whitespace().collect();
+                    if !wanted.iter().all(|w| have.contains(w)) {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }
@@ -3234,14 +3567,23 @@ impl Document {
         }
         let old_children = std::mem::take(&mut self.nodes[id.index()].children);
         for child in old_children {
+            if self.shadow_hosts.contains_key(&child) {
+                self.nodes[id.index()].children.push(child);
+                continue;
+            }
             if let Some(node) = self.nodes.get_mut(child.index()) {
                 node.parent = None;
             }
         }
+        self.mark_style_dirty(id);
         if html_fragment.trim().is_empty() {
             return;
         }
         let parsed = parse_html(html_fragment);
+        let head_children: Vec<NodeId> = parsed.children(parsed.head()).to_vec();
+        for src_child in head_children {
+            self.clone_subtree_into(&parsed, src_child, id);
+        }
         let body_children: Vec<NodeId> = parsed.children(parsed.body()).to_vec();
         for src_child in body_children {
             self.clone_subtree_into(&parsed, src_child, id);
@@ -3405,6 +3747,7 @@ impl Document {
             .children
             .retain(|id| *id != child);
         self.nodes[child.index()].parent = None;
+        self.mark_style_dirty(parent);
     }
 
     /// Depth-first search for the first element whose tag equals `tag`.
@@ -3463,8 +3806,11 @@ impl Document {
         if let Some(text) = self.get(id).data().text() {
             out.push_str(text);
         }
-        for child in self.children(id) {
-            self.collect_text(*child, out);
+        for &child in self.children(id) {
+            if self.shadow_hosts.contains_key(&child) {
+                continue;
+            }
+            self.collect_text(child, out);
         }
     }
 
@@ -3482,8 +3828,11 @@ impl Document {
             }
             return;
         }
-        for child in self.children(id) {
-            self.collect_style(*child, out);
+        for &child in self.children(id) {
+            if self.shadow_hosts.contains_key(&child) {
+                continue;
+            }
+            self.collect_style(child, out);
         }
     }
 
@@ -3520,8 +3869,11 @@ impl Document {
             }
             _ => {}
         }
-        for child in self.children(id) {
-            self.collect_style_sheets(*child, out);
+        for &child in self.children(id) {
+            if self.shadow_hosts.contains_key(&child) {
+                continue;
+            }
+            self.collect_style_sheets(child, out);
         }
     }
 
@@ -4846,5 +5198,53 @@ mod tests {
             Some(ro)
         );
         assert_eq!(doc.query_selector("details:open"), Some(det_open));
+    }
+
+    #[test]
+    fn dirty_style_tracking_and_shadow_slot_composition_work() {
+        let mut doc = parse_html(
+            "<div id=\"host\" class=\"card\">\
+               <span id=\"s-title\" slot=\"title\">Custom Header</span>\
+               <p id=\"s-body\">Body Copy</p>\
+             </div>",
+        );
+        assert!(!doc.has_dirty_styles());
+        let host = doc.get_element_by_id("host").unwrap();
+        let s_title = doc.get_element_by_id("s-title").unwrap();
+        let s_body = doc.get_element_by_id("s-body").unwrap();
+
+        let sr = doc.attach_shadow(host, true);
+        assert!(doc.has_dirty_styles());
+        assert_eq!(doc.take_dirty_style_nodes(), vec![host, sr]);
+        assert!(!doc.has_dirty_styles());
+
+        doc.set_inner_html(
+            sr,
+            "<header id=\"hdr\" part=\"banner\"><slot id=\"slot-title\" name=\"title\">Fallback</slot></header>\
+             <main id=\"mn\"><slot id=\"slot-default\">Default Fallback</slot></main>",
+        );
+        assert!(doc.has_dirty_styles());
+        let _ = doc.take_dirty_style_nodes();
+
+        let hdr = doc.query_selector_within(sr, "#hdr").unwrap();
+        let mn = doc.query_selector_within(sr, "#mn").unwrap();
+        let slot_title = doc.query_selector_within(sr, "#slot-title").unwrap();
+        let slot_default = doc.query_selector_within(sr, "#slot-default").unwrap();
+
+        // Host's composed children are the shadow root's children (`#hdr`, `#mn`)
+        assert_eq!(doc.composed_children(host).as_ref(), &[hdr, mn]);
+        // Named slot projects `#s-title`
+        assert_eq!(doc.assigned_nodes(slot_title, false), vec![s_title]);
+        assert_eq!(doc.composed_children(slot_title).as_ref(), &[s_title]);
+        assert_eq!(doc.assigned_slot(s_title), Some(slot_title));
+        // Default slot projects `#s-body`
+        assert_eq!(doc.assigned_nodes(slot_default, false), vec![s_body]);
+        assert_eq!(doc.composed_children(slot_default).as_ref(), &[s_body]);
+        assert_eq!(doc.assigned_slot(s_body), Some(slot_default));
+
+        // Selector matching for `::slotted(...)`, `::part(...)`, and `:host(...)`
+        assert!(doc.matches_selector(s_title, "::slotted(span)"));
+        assert!(doc.matches_selector(hdr, "::part(banner)"));
+        assert!(doc.matches_selector(sr, ":host(.card)"));
     }
 }

@@ -61,7 +61,96 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
     None
 }
 
+fn find_go_binary() -> PathBuf {
+    if let Ok(go_bin) = env::var("ANVIL_GO_BIN") {
+        let p = PathBuf::from(go_bin);
+        if p.exists() {
+            return p;
+        }
+    }
+    let candidates = [
+        r"C:\Program Files\Go\bin\go.exe",
+        "/usr/local/go/bin/go",
+        "/usr/bin/go",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("go")
+}
+
+fn build_go_anvil_json(out_dir: &Path) {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let go_repo = manifest_dir.join("../../..").join("anvil-json");
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_repo.join("go.mod").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_repo.join("json.go").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_repo.join("pointer.go").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_repo.join("wire.go").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_repo.join("cmd/anvil-json/main.go").display()
+    );
+
+    let bin_name = if cfg!(windows) {
+        "anvil-json-go.exe"
+    } else {
+        "anvil-json-go"
+    };
+    let bin_path = out_dir.join(bin_name);
+    let gocache = out_dir.join("gocache");
+    let gotmp = out_dir.join("gotmp");
+    let _ = fs::create_dir_all(&gocache);
+    let _ = fs::create_dir_all(&gotmp);
+
+    let go = find_go_binary();
+    let status = Command::new(&go)
+        .current_dir(&go_repo)
+        .env("CGO_ENABLED", "0")
+        .env("GOCACHE", &gocache)
+        .env("GOTMPDIR", &gotmp)
+        .arg("build")
+        .arg("-trimpath")
+        .arg("-ldflags=-s -w")
+        .arg("-buildvcs=false")
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("./cmd/anvil-json")
+        .status()
+        .expect("failed to invoke Go compiler for ../../../anvil-json");
+
+    assert!(
+        status.success() && bin_path.exists(),
+        "go build failed for ../../../anvil-json"
+    );
+
+    println!(
+        "cargo:rustc-env=ANVIL_JSON_GO_BIN={}",
+        bin_path.to_string_lossy()
+    );
+}
+
 fn main() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    build_go_anvil_json(&out_dir);
+    println!(
+        "cargo:rerun-if-changed=../../../anvil-browser/engines/cinder/js/src/runtime/dom_web_bootstrap.js"
+    );
+
     let cpp_dir = if Path::new(ENGINE_CPP_DIR).exists() {
         ENGINE_CPP_DIR
     } else {
@@ -78,8 +167,6 @@ fn main() {
         units.push((src, *stem));
     }
     println!("cargo:rustc-check-cfg=cfg(cinder_cpp_jit)");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
     if cfg!(target_os = "windows") {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))

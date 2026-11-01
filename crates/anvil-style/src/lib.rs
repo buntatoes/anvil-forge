@@ -2335,10 +2335,12 @@ pub fn compute_styles_parallel(
     let mut styles = vec![ComputedStyle::initial(); total_nodes];
     let html_id = doc.html();
     let mut root_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
+    let shadow_sheets = build_shadow_sheets(doc);
     let index = selectors::DocIndex::build(doc);
     let matcher = selectors::Matcher::new(doc, Some(&index));
     let mut cx = Cascade {
         sheet,
+        shadow_sheets: &shadow_sheets,
         viewport_width,
         root_font_px: 16.0,
         animator: None,
@@ -2404,6 +2406,7 @@ pub fn compute_styles_parallel(
             viewport_width,
         );
         let index = &index;
+        let shadow_sheets_ref = &shadow_sheets;
         let chunk_size = body_children.len().div_ceil(workers);
         let branch_results: Vec<Vec<(usize, ComputedStyle)>> = std::thread::scope(|s| {
             let mut handles = Vec::new();
@@ -2414,6 +2417,7 @@ pub fn compute_styles_parallel(
                     let matcher = selectors::Matcher::new(doc, Some(index));
                     let worker_cx = Cascade {
                         sheet,
+                        shadow_sheets: shadow_sheets_ref,
                         viewport_width,
                         root_font_px,
                         animator: None,
@@ -2525,6 +2529,212 @@ pub fn compute_styles_animated(
     styles
 }
 
+/// Incrementally re-cascade dirty subtrees recorded on `doc` (plus any elements
+/// with active transitions or keyframe animations in `animator`) into `styles`.
+///
+/// Consumes `doc.take_dirty_style_nodes()` and re-cascades only the affected
+/// subtrees, extending `styles` if new nodes were allocated. When an [`Animator`]
+/// is provided, any property change on a re-cascaded element with a `transition`
+/// starts a transition from its previous computed value.
+/// Returns the number of element nodes re-cascaded in this pass.
+pub fn compute_styles_incremental(
+    doc: &mut Document,
+    sheet: &Stylesheet,
+    styles: &mut StyleMap,
+    viewport_width: f32,
+    viewport_height: f32,
+    mut animator: Option<&mut Animator>,
+) -> usize {
+    let viewport_width = viewport_width.max(0.0);
+    let viewport_height = viewport_height.max(0.0);
+    let mut dirty = doc.take_dirty_style_nodes();
+    if let Some(anim) = animator.as_deref() {
+        for active_id in anim.active_nodes() {
+            if !dirty.contains(&active_id) {
+                dirty.push(active_id);
+            }
+        }
+    }
+    let total_nodes = doc_len(doc);
+    if dirty.is_empty()
+        && styles.styles.len() >= total_nodes
+        && (styles.viewport_width - viewport_width).abs() < f32::EPSILON
+        && (styles.viewport_height - viewport_height).abs() < f32::EPSILON
+    {
+        return 0;
+    }
+    if styles.styles.is_empty()
+        || dirty.contains(&doc.root())
+        || dirty.contains(&doc.html())
+        || (styles.viewport_width - viewport_width).abs() >= f32::EPSILON
+        || (styles.viewport_height - viewport_height).abs() >= f32::EPSILON
+    {
+        if let Some(anim) = animator.as_deref_mut() {
+            anim.begin_pass();
+            for (idx, existing) in styles.styles.iter().enumerate() {
+                anim.seed_if_absent(NodeId::from_raw(idx as u32), existing);
+            }
+        }
+        *styles = cascade_document(doc, sheet, viewport_width, viewport_height, animator);
+        return total_nodes;
+    }
+
+    if styles.styles.len() < total_nodes {
+        styles.styles.resize(total_nodes, ComputedStyle::initial());
+    }
+    if let Some(anim) = animator.as_deref_mut() {
+        anim.begin_pass();
+        for &d in &dirty {
+            if let Some(existing) = styles.styles.get(d.index()) {
+                anim.seed_if_absent(d, existing);
+            }
+        }
+    }
+
+    // Normalize dirty nodes: promote text nodes to their parent element and keep
+    // only top-most dirty roots so each affected subtree is walked once.
+    let mut roots: Vec<NodeId> = Vec::new();
+    for d in dirty {
+        if d.index() >= total_nodes {
+            continue;
+        }
+        let elem_id = if doc.get(d).data().tag().is_some() {
+            d
+        } else {
+            doc.parent_element(d).unwrap_or(doc.body())
+        };
+        if !roots.contains(&elem_id) {
+            roots.push(elem_id);
+        }
+    }
+    let roots_snapshot = roots.clone();
+    roots.retain(|&cand| {
+        !roots_snapshot
+            .iter()
+            .any(|&anc| anc != cand && doc.contains_node(anc, cand))
+    });
+
+    let shadow_sheets = build_shadow_sheets(doc);
+    let index = selectors::DocIndex::build(doc);
+    let matcher = selectors::Matcher::new(doc, Some(&index));
+    let root_font_px = styles
+        .styles
+        .get(doc.html().index())
+        .map(|s| s.font_size)
+        .unwrap_or(16.0);
+    let mut cx = Cascade {
+        sheet,
+        shadow_sheets: &shadow_sheets,
+        viewport_width,
+        root_font_px,
+        animator,
+        matcher: &matcher,
+    };
+
+    let mut updated_count = 0usize;
+    for sub_root in roots {
+        let mut ancestors = Vec::new();
+        let mut cursor = doc.parent_element(sub_root);
+        while let Some(anc) = cursor {
+            ancestors.push(anc);
+            cursor = doc.parent_element(anc);
+        }
+        ancestors.reverse();
+        let mut parent_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
+        let mut container_w = viewport_width;
+        let mut parent_style = ComputedStyle::initial();
+        let mut parent_base = ComputedStyle::initial();
+        for anc in ancestors {
+            if let Some(anim) = cx.animator.as_deref_mut()
+                && let Some(existing) = styles.styles.get(anc.index())
+            {
+                anim.seed_if_absent(anc, existing);
+            }
+            let (st, base, vars, next_w) = walk_node_step(
+                doc,
+                anc,
+                &parent_style,
+                &parent_base,
+                &parent_vars,
+                &mut cx,
+                container_w,
+                &mut styles.styles,
+            );
+            parent_style = st;
+            parent_base = base;
+            parent_vars = vars;
+            container_w = next_w;
+        }
+        updated_count += walk_incremental(
+            doc,
+            sub_root,
+            &parent_style,
+            &parent_base,
+            &parent_vars,
+            &mut cx,
+            container_w,
+            &mut styles.styles,
+        );
+    }
+    styles.root_font_px = cx.root_font_px;
+    let (before_styles, after_styles) = cascade_pseudo_elements(
+        doc,
+        sheet,
+        viewport_width,
+        cx.root_font_px,
+        &styles.styles,
+        &matcher,
+    );
+    styles.before_styles = before_styles;
+    styles.after_styles = after_styles;
+    updated_count
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_incremental(
+    doc: &Document,
+    id: NodeId,
+    parent: &ComputedStyle,
+    parent_base: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
+    cx: &mut Cascade,
+    container_width: f32,
+    out: &mut [ComputedStyle],
+) -> usize {
+    if let Some(anim) = cx.animator.as_deref_mut()
+        && let Some(existing) = out.get(id.index())
+    {
+        anim.seed_if_absent(id, existing);
+    }
+    let (style, base, vars, child_container_w) = walk_node_step(
+        doc,
+        id,
+        parent,
+        parent_base,
+        parent_vars,
+        cx,
+        container_width,
+        out,
+    );
+    let mut count = usize::from(doc.get(id).data().tag().is_some());
+    let children: Vec<NodeId> = doc.children(id).to_vec();
+    for child in children {
+        count += walk_incremental(doc, child, &style, &base, &vars, cx, child_container_w, out);
+    }
+    count
+}
+
+fn build_shadow_sheets(doc: &Document) -> Vec<(NodeId, NodeId, Stylesheet)> {
+    let mut out = Vec::new();
+    for (host, sr, _) in doc.shadow_root_entries() {
+        let css = doc.shadow_css(sr);
+        if !css.trim().is_empty() {
+            out.push((host, sr, parse_css(&css)));
+        }
+    }
+    out
+}
+
 /// Shared body of the `compute_styles` entry points.
 fn cascade_document(
     doc: &Document,
@@ -2536,10 +2746,12 @@ fn cascade_document(
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
+    let shadow_sheets = build_shadow_sheets(doc);
     let index = selectors::DocIndex::build(doc);
     let matcher = selectors::Matcher::new(doc, Some(&index));
     let mut cx = Cascade {
         sheet,
+        shadow_sheets: &shadow_sheets,
         viewport_width,
         root_font_px: 16.0,
         animator,
@@ -2747,6 +2959,7 @@ fn resolve_pseudo_content(raw: &str, doc: &Document, id: NodeId) -> Option<Strin
 /// What stays the same across one cascade walk.
 struct Cascade<'a> {
     sheet: &'a Stylesheet,
+    shadow_sheets: &'a [(NodeId, NodeId, Stylesheet)],
     viewport_width: f32,
     /// Font size of `html` once it is styled; 16 before that.
     root_font_px: f32,
@@ -3032,6 +3245,13 @@ fn apply_author(
         }
     };
     let inline_rank = u32::from(u16::MAX) + 1;
+    let enclosing_host = if cx.shadow_sheets.is_empty() {
+        None
+    } else {
+        doc.enclosing_shadow_host(id)
+    };
+    let in_scoped_shadow_tree = enclosing_host
+        .is_some_and(|h| h != id && cx.shadow_sheets.iter().any(|(sh, _, _)| *sh == h));
 
     let mut entries: Vec<MatchedDecl> = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
@@ -3055,7 +3275,12 @@ fn apply_author(
         let specificity = rule
             .selectors
             .iter()
-            .filter(|selector| cx.matcher.matches_with_scope(selector, id, scope_root))
+            .filter(|selector| {
+                if in_scoped_shadow_tree && !selector.has_part() {
+                    return false;
+                }
+                cx.matcher.matches_with_scope(selector, id, scope_root)
+            })
             .map(Selector::specificity)
             .max();
         if let Some(specificity) = specificity {
@@ -3078,13 +3303,80 @@ fn apply_author(
             }
         }
     }
+    if !cx.shadow_sheets.is_empty() {
+        let slotted_host = doc
+            .assigned_slot(id)
+            .and_then(|slot_id| doc.enclosing_shadow_host(slot_id));
+        let mut shadow_order_base = sheet.rules.len();
+        for (sh_host, sh_root, sh_sheet) in cx.shadow_sheets {
+            let is_host = id == *sh_host;
+            let is_inner = enclosing_host == Some(*sh_host) && id != *sh_host;
+            let is_slotted = slotted_host == Some(*sh_host);
+            if !is_host && !is_inner && !is_slotted {
+                shadow_order_base += sh_sheet.rules.len();
+                continue;
+            }
+            for (order, rule) in sh_sheet.rules.iter().enumerate() {
+                if let Some(mq) = &rule.media
+                    && !mq.matches(viewport_width)
+                {
+                    continue;
+                }
+                if let Some(cq) = &rule.container
+                    && !cq.matches(container_width)
+                {
+                    continue;
+                }
+                let specificity = rule
+                    .selectors
+                    .iter()
+                    .filter(|selector| {
+                        if is_host && !selector.has_host() {
+                            return false;
+                        }
+                        if is_slotted && !selector.has_slotted() {
+                            return false;
+                        }
+                        if is_inner && selector.has_slotted() {
+                            return false;
+                        }
+                        cx.matcher.matches_with_scope(selector, id, Some(*sh_root))
+                    })
+                    .map(Selector::specificity)
+                    .max();
+                if let Some(specificity) = specificity {
+                    for (decl_idx, decl) in rule.declarations.iter().enumerate() {
+                        let layer_rank = if decl.important {
+                            important_layer_rank(rule.layer)
+                        } else {
+                            normal_layer_rank(rule.layer)
+                        };
+                        entries.push(MatchedDecl {
+                            important: decl.important,
+                            layer_rank,
+                            specificity,
+                            inv_scope_hops: u16::MAX,
+                            rule_order: shadow_order_base + order,
+                            decl_order: decl_idx,
+                            decl,
+                        });
+                    }
+                }
+            }
+            shadow_order_base += sh_sheet.rules.len();
+        }
+    }
     let inline = doc
         .get(id)
         .data()
         .attr("style")
         .map(parse_declarations)
         .unwrap_or_default();
-    let inline_rule_order = sheet.rules.len();
+    let inline_rule_order = sheet.rules.len()
+        + cx.shadow_sheets
+            .iter()
+            .map(|(_, _, s)| s.rules.len())
+            .sum::<usize>();
     for (decl_idx, decl) in inline.iter().enumerate() {
         entries.push(MatchedDecl {
             important: decl.important,
@@ -8007,5 +8299,104 @@ mod tests {
         assert_eq!(code_el.text_transform, TextTransform::Uppercase);
         assert!(del_el.line_through);
         assert_eq!(hero_img.object_fit, ObjectFit::Cover);
+    }
+
+    #[test]
+    fn shadow_dom_scoped_styles_slotted_part_and_incremental_cascade_work() {
+        let mut doc = anvil_dom::parse_html(
+            "<style>\
+               .inner { color: #112233; }\
+               #host::part(banner) { background-color: #445566; }\
+               #box { opacity: 1; width: 100px; transition: opacity 200ms linear, width 200ms linear; }\
+               #box.active { opacity: 0.2; width: 300px; }\
+             </style>\
+             <div id=\"outer\" class=\"inner\">Outer</div>\
+             <div id=\"host\" class=\"card\">\
+               <span id=\"slotted-title\" slot=\"title\" class=\"hl\">Slotted Title</span>\
+             </div>\
+             <div id=\"box\">Box</div>",
+        );
+        let host = doc.get_element_by_id("host").unwrap();
+        let outer = doc.get_element_by_id("outer").unwrap();
+        let slotted_title = doc.get_element_by_id("slotted-title").unwrap();
+        let box_id = doc.get_element_by_id("box").unwrap();
+
+        let sr = doc.attach_shadow(host, true);
+        doc.set_inner_html(
+            sr,
+            "<style>\
+               :host(.card) { border: 2px solid #abcdef; }\
+               .inner { color: #ff00aa; }\
+               slot[name=\"title\"]::slotted(.hl) { color: #00cc88; }\
+             </style>\
+             <header id=\"hdr\" class=\"inner\" part=\"banner\">\
+               <slot name=\"title\"></slot>\
+             </header>",
+        );
+        doc.clear_dirty_styles();
+
+        let sheet = parse_css(&doc.embedded_css());
+        let mut styles = compute_styles_for_viewport(&doc, &sheet, 800.0, 600.0);
+        let hdr = doc.query_selector_within(sr, "#hdr").unwrap();
+
+        // Shadow `:host(.card)` styled `#host`
+        assert_eq!(styles.get(host).border.top, 2.0);
+        assert_eq!(
+            styles.get(host).border_color,
+            Color::parse("#abcdef").unwrap()
+        );
+        // Shadow `.inner` styled `#hdr` without leaking to `#outer`
+        assert_eq!(styles.get(hdr).color, Color::parse("#ff00aa").unwrap());
+        assert_eq!(styles.get(outer).color, Color::parse("#112233").unwrap());
+        // Document `#host::part(banner)` styled `#hdr`'s background
+        assert_eq!(
+            styles.get(hdr).background,
+            Some(Color::parse("#445566").unwrap())
+        );
+        // Shadow `slot[name="title"]::slotted(.hl)` styled `#slotted-title`
+        assert_eq!(
+            styles.get(slotted_title).color,
+            Color::parse("#00cc88").unwrap()
+        );
+
+        // Incremental cascade + CSS transition on `#box` class mutation
+        let mut animator = Animator::new();
+        animator.tick(0.0);
+        assert_eq!(
+            compute_styles_incremental(
+                &mut doc,
+                &sheet,
+                &mut styles,
+                800.0,
+                600.0,
+                Some(&mut animator)
+            ),
+            0
+        );
+
+        doc.add_class(box_id, "active");
+        let updated = compute_styles_incremental(
+            &mut doc,
+            &sheet,
+            &mut styles,
+            800.0,
+            600.0,
+            Some(&mut animator),
+        );
+        assert!(updated >= 1);
+        assert!(animator.is_animating());
+
+        // Advance clock to 100ms (50% of 200ms linear transition)
+        assert!(animator.tick(100.0));
+        let _ = compute_styles_incremental(
+            &mut doc,
+            &sheet,
+            &mut styles,
+            800.0,
+            600.0,
+            Some(&mut animator),
+        );
+        assert!((styles.get(box_id).opacity - 0.6).abs() < 1e-4);
+        assert_eq!(styles.get(box_id).width, Size::Px(200.0));
     }
 }

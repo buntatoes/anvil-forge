@@ -19,5 +19,4 @@ publish.workspace = true
 anvil-dom = { path = "../anvil-dom" }
 anvil-style = { path = "../anvil-style" }
 anvil-layout = { path = "../anvil-layout" }
-anvil-json.workspace = true
 anvil-video.workspace = true
