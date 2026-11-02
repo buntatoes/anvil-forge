@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version             = "0.24.5.2"
+	Version             = "0.25.0"
 	RenderingEngineName = dom.RenderingEngineName
 	JsEngineName        = dom.JsEngineName
 	CssEngineName       = dom.CssEngineName

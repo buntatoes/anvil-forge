@@ -2,7 +2,7 @@
   <h1>Anvil Forge Engine</h1>
   <p>Pure-Go page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.24.5.2-ff6b24?style=flat-square" alt="v.24.5.2" />
+    <img src="https://img.shields.io/badge/release-v.25-ff6b24?style=flat-square" alt="v.25" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="https://github.com/buntatoes/anvil-forge/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-forge/actions/workflows/ci.yml/badge.svg" alt="CI: go vet, build, and tests" /></a>
     <img src="https://img.shields.io/badge/external_modules-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external modules (offline verified)" />
@@ -15,7 +15,7 @@
 > [!IMPORTANT]
 > **Archived & Frozen in Time**: This standalone repository is archived and frozen in time as a historical snapshot. Active development now lives in-tree inside [buntatoes/anvil-browser](https://github.com/buntatoes/anvil-browser) under `engines/go/anvil-forge`.
 
-Version 0.24.5.2 (`v.24.5.2`). Author: Buntato.
+Version 0.25.0 (`v.25`). Author: Buntato.
 
 This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is licensed under the **Apache License, Version 2.0** (`Apache-2.0`). See [License](#license).
 
