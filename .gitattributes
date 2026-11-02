@@ -2,6 +2,8 @@
 # Copyright (c) 2026 Buntato
 # GitHub Linguist language classification for Forge
 
+*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
+go.mod linguist-language=Go linguist-detectable=true
 *.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.css linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
