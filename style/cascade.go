@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato. Verify canonical repository history at https://github.com/buntatoes
 
 package style
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/buntatoes/anvil-engine/dom"
+	"github.com/buntatoes/anvil-forge/dom"
 )
 
 type ComputedStyle struct {

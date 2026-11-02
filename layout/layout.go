@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato. Verify canonical repository history at https://github.com/buntatoes
 
 package layout
@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/buntatoes/anvil-engine/dom"
-	"github.com/buntatoes/anvil-engine/style"
+	"github.com/buntatoes/anvil-forge/dom"
+	"github.com/buntatoes/anvil-forge/style"
 	anvilimage "github.com/buntatoes/anvil-image"
 	anvilttf "github.com/buntatoes/anvil-ttf"
 )

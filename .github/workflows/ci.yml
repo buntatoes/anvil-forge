@@ -1,5 +1,5 @@
-# Build, vet, and test anvil-engine on Linux and Windows using Go.
-# Sibling Go dependencies anvil-compress, anvil-image, and anvil-ttf are checked out alongside anvil-engine.
+# Build, vet, and test anvil-forge on Linux and Windows using Go.
+# Sibling Go dependencies anvil-compress, anvil-image, and anvil-ttf are checked out alongside anvil-forge.
 
 name: ci
 
@@ -26,12 +26,12 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: anvil-engine
+        working-directory: anvil-forge
     steps:
       - name: Check out
         uses: actions/checkout@v4
         with:
-          path: anvil-engine
+          path: anvil-forge
 
       - name: Check out sibling repositories
         working-directory: .
@@ -60,4 +60,4 @@ jobs:
         run: go test -v ./...
 
       - name: Build CLI and worker binary
-        run: go build ./cmd/anvil-engine
+        run: go build ./cmd/anvil-forge

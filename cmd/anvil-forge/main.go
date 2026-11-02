@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato. Verify canonical repository history at https://github.com/buntatoes
 
 package main
@@ -8,9 +8,9 @@ import (
 	"io"
 	"os"
 
-	anvilengine "github.com/buntatoes/anvil-engine"
-	"github.com/buntatoes/anvil-engine/dom"
-	"github.com/buntatoes/anvil-engine/script"
+	anvilengine "github.com/buntatoes/anvil-forge"
+	"github.com/buntatoes/anvil-forge/dom"
+	"github.com/buntatoes/anvil-forge/script"
 )
 
 func main() {
@@ -19,7 +19,7 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: anvil-engine <self-test|render-html|validate-wasm>")
+		fmt.Fprintln(stderr, "usage: anvil-forge <self-test|render-html|validate-wasm>")
 		return 2
 	}
 	switch args[0] {
@@ -39,7 +39,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "self-test DOM verification failed")
 			return 1
 		}
-		fmt.Fprintf(stdout, "anvil-engine %s (%s/%s/%s) ok\n",
+		fmt.Fprintf(stdout, "anvil-forge %s (%s/%s/%s) ok\n",
 			anvilengine.Version,
 			anvilengine.RenderingEngineName,
 			anvilengine.CssEngineName,

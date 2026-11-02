@@ -1,15 +1,15 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato. Verify canonical repository history at https://github.com/buntatoes
 
 package anvilengine
 
 import (
-	"github.com/buntatoes/anvil-engine/dom"
-	"github.com/buntatoes/anvil-engine/layout"
-	"github.com/buntatoes/anvil-engine/paint"
-	"github.com/buntatoes/anvil-engine/raster"
-	"github.com/buntatoes/anvil-engine/script"
-	"github.com/buntatoes/anvil-engine/style"
+	"github.com/buntatoes/anvil-forge/dom"
+	"github.com/buntatoes/anvil-forge/layout"
+	"github.com/buntatoes/anvil-forge/paint"
+	"github.com/buntatoes/anvil-forge/raster"
+	"github.com/buntatoes/anvil-forge/script"
+	"github.com/buntatoes/anvil-forge/style"
 )
 
 const (

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato. Verify canonical repository history at https://github.com/buntatoes
 
 package paint
@@ -7,8 +7,8 @@ import (
 	"math"
 	"sort"
 
-	"github.com/buntatoes/anvil-engine/layout"
-	"github.com/buntatoes/anvil-engine/style"
+	"github.com/buntatoes/anvil-forge/layout"
+	"github.com/buntatoes/anvil-forge/style"
 )
 
 type DisplayItemKind int

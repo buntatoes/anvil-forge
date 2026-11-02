@@ -4,18 +4,22 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.24.5.2-ff6b24?style=flat-square" alt="v.24.5.2" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <a href="https://github.com/buntatoes/anvil-engine/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-engine/actions/workflows/ci.yml/badge.svg" alt="CI: go vet, build, and tests" /></a>
+    <a href="https://github.com/buntatoes/anvil-forge/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-forge/actions/workflows/ci.yml/badge.svg" alt="CI: go vet, build, and tests" /></a>
     <img src="https://img.shields.io/badge/external_modules-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external modules (offline verified)" />
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Noncommercial_%28based_on_PolyForm_1.0.0%29_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="Noncommercial (based on PolyForm 1.0.0) | Paid Commercial (Non-Compete)" /></a>
+    <img src="https://img.shields.io/badge/archive-Frozen_in_Time-8b949e?style=flat-square" alt="Archived and Frozen in Time" />
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
     <img src="https://img.shields.io/badge/go-1.22+-00ADD8?style=flat-square" alt="Go 1.22+" />
   </p>
 </div>
 
+> [!IMPORTANT]
+> **Archived & Frozen in Time**: This standalone repository is archived and frozen in time as a historical snapshot. Active development now lives in-tree inside [buntatoes/anvil-browser](https://github.com/buntatoes/anvil-browser) under `engines/go/anvil-forge`.
+
 Version 0.24.5.2 (`v.24.5.2`). Author: Buntato.
 
-This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under **noncommercial terms based on the PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
+This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is licensed under the **Apache License, Version 2.0** (`Apache-2.0`). See [License](#license).
 
-100% pure Go (`module github.com/buntatoes/anvil-engine`) with zero external module dependencies.
+100% pure Go (`module github.com/buntatoes/anvil-forge`) with zero external module dependencies.
 
 ## Pipeline
 
@@ -40,7 +44,7 @@ go test -v ./...
 
 ## The other repositories
 
-The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser) and this page engine is [anvil-engine](https://github.com/buntatoes/anvil-engine), built alongside the nine companion libraries below.
+The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser) and this page engine is [anvil-forge](https://github.com/buntatoes/anvil-forge), built alongside the nine companion libraries below.
 
 | Repository | What it is |
 | --- | --- |
@@ -56,4 +60,4 @@ The browser is [anvil-browser](https://github.com/buntatoes/anvil-browser) and t
 
 ## License
 
-Dual-licensed under **noncommercial terms based on the PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. See [LICENSE](./LICENSE).
+Licensed under the **Apache License, Version 2.0** (`Apache-2.0`). Copyright (c) 2026 Buntato. Pursuant to Section 6 of the Apache License 2.0, the names **"Anvil"**, **"Anvil Browser"**, **"Anvil Forge"** (**"Forge"**), **"Cinder"**, **"Prism"**, and the Anvil brand logo/emblem are copyrighted and trademarked by **Buntato** (*All Rights Reserved*) and may not be used to brand derivative works without written permission. See [LICENSE](./LICENSE).
