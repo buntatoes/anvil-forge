@@ -11,6 +11,8 @@ import (
 	"github.com/buntatoes/anvil-engine/layout"
 	"github.com/buntatoes/anvil-engine/paint"
 	"github.com/buntatoes/anvil-engine/style"
+	anvilimage "github.com/buntatoes/anvil-image"
+	anvilttf "github.com/buntatoes/anvil-ttf"
 )
 
 const (
@@ -361,29 +363,23 @@ func (fb *Framebuffer) DrawText(x, y, fontSize float32, text string, col style.C
 	}
 }
 
-func SrgbToLinearU12(srgb uint8) uint16 {
-	s := float64(srgb) / 255.0
-	var lin float64
-	if s <= 0.04045 {
-		lin = s / 12.92
-	} else {
-		lin = math.Pow((s+0.055)/1.055, 2.4)
+func (fb *Framebuffer) BlitAnvilImage(x, y, w, h, radius float32, img *anvilimage.Image, clip clipRect) {
+	if img == nil {
+		return
 	}
-	return uint16(math.Round(lin * 4095.0))
+	fb.BlitImage(x, y, w, h, radius, &layout.Image{
+		Width:  img.Width,
+		Height: img.Height,
+		RGBA:   img.Pixels,
+	}, clip)
+}
+
+func SrgbToLinearU12(srgb uint8) uint16 {
+	return anvilttf.SRGBToLinearU12(srgb)
 }
 
 func LinearU12ToSrgb(lin uint16) uint8 {
-	if lin >= 4095 {
-		return 255
-	}
-	l := float64(lin) / 4095.0
-	var s float64
-	if l <= 0.0031308 {
-		s = l * 12.92
-	} else {
-		s = 1.055*math.Pow(l, 1.0/2.4) - 0.055
-	}
-	return uint8(math.Round(s * 255.0))
+	return anvilttf.LinearU12ToSRGB(lin)
 }
 
 func BlendGlyphPixelGammaCorrect(dst [4]uint8, fg style.Color, coverage uint8) [4]uint8 {

@@ -10,6 +10,8 @@ import (
 
 	"github.com/buntatoes/anvil-engine/dom"
 	"github.com/buntatoes/anvil-engine/style"
+	anvilimage "github.com/buntatoes/anvil-image"
+	anvilttf "github.com/buntatoes/anvil-ttf"
 )
 
 type Rect struct {
@@ -36,6 +38,37 @@ type Image struct {
 	Width  uint32
 	Height uint32
 	RGBA   []byte
+}
+
+func DecodeImage(data []byte) (*Image, error) {
+	img, err := anvilimage.DecodeAuto(data)
+	if err != nil {
+		return nil, err
+	}
+	return &Image{
+		Width:  img.Width,
+		Height: img.Height,
+		RGBA:   img.Pixels,
+	}, nil
+}
+
+func FromAnvilImage(img *anvilimage.Image) *Image {
+	if img == nil {
+		return nil
+	}
+	return &Image{
+		Width:  img.Width,
+		Height: img.Height,
+		RGBA:   img.Pixels,
+	}
+}
+
+func (img *Image) ToAnvilImage() *anvilimage.Image {
+	if img == nil {
+		return nil
+	}
+	ai, _ := anvilimage.FromRGBA(img.Width, img.Height, img.RGBA)
+	return ai
 }
 
 type TextRun struct {
@@ -695,7 +728,7 @@ func MeasureTextWidth(text string, fontSize, letterSpacing float32) float32 {
 		return 0
 	}
 	runes := []rune(text)
-	return float32(len(runes))*(fontSize*0.55) + float32(len(runes))*letterSpacing
+	return anvilttf.MeasureProportionalFallback(text, fontSize) + float32(len(runes))*letterSpacing
 }
 
 func applyTextTransform(s string, tt style.TextTransform) string {

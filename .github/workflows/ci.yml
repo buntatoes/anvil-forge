@@ -1,5 +1,5 @@
 # Build, vet, and test anvil-engine on Linux and Windows using Go.
-# Zero external dependencies in go.mod.
+# Sibling Go dependencies anvil-compress, anvil-image, and anvil-ttf are checked out alongside anvil-engine.
 
 name: ci
 
@@ -26,9 +26,19 @@ jobs:
     defaults:
       run:
         shell: bash
+        working-directory: anvil-engine
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          path: anvil-engine
+
+      - name: Check out sibling repositories
+        working-directory: .
+        run: |
+          for repo in anvil-compress anvil-image anvil-ttf; do
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+          done
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -38,8 +48,8 @@ jobs:
 
       - name: Check for outside Go modules
         run: |
-          if grep -E 'require|replace' go.mod; then
-            echo "go.mod lists external dependencies."
+          if grep -E 'github\.com/' go.mod | grep -v 'github\.com/buntatoes/anvil-'; then
+            echo "go.mod lists a module outside the anvil repositories."
             exit 1
           fi
 
