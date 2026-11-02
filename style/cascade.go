@@ -183,11 +183,58 @@ func ComputeStylesWithViewport(doc *dom.Document, sheet *Stylesheet, vw, vh uint
 }
 
 func ComputeStylesIncremental(doc *dom.Document, sheet *Stylesheet, prev *StyleMap, vw, vh uint32) *StyleMap {
-	dirty := doc.TakeDirtyStyleNodes()
-	if prev == nil || len(dirty) == 0 {
-		return ComputeStylesWithViewport(doc, sheet, vw, vh)
+	sm, _ := ComputeStylesIncrementalCount(doc, sheet, prev, vw, vh)
+	return sm
+}
+
+func ComputeStylesIncrementalCount(doc *dom.Document, sheet *Stylesheet, prev *StyleMap, vw, vh uint32) (*StyleMap, int) {
+	roots := doc.TakeCoalescedDirtySubtreeRoots()
+	if prev == nil || prev.Styles == nil || prev.ViewportW != vw || prev.ViewportH != vh {
+		fresh := ComputeStylesWithViewport(doc, sheet, vw, vh)
+		return fresh, len(fresh.Styles)
 	}
-	return ComputeStylesWithViewport(doc, sheet, vw, vh)
+	if len(roots) == 0 {
+		return prev, 0
+	}
+	for _, r := range roots {
+		if r == doc.Root() || r == doc.HTML() {
+			fresh := ComputeStylesWithViewport(doc, sheet, vw, vh)
+			return fresh, len(fresh.Styles)
+		}
+	}
+
+	recascaded := 0
+	var walkSubtree func(dom.NodeId, *ComputedStyle)
+	walkSubtree = func(id dom.NodeId, parent *ComputedStyle) {
+		n := doc.Node(id)
+		if n == nil {
+			return
+		}
+		if n.Data.Kind == dom.NodeKindElement {
+			st := resolveElementStyle(doc, id, parent, sheet, prev.RootFontPx, float32(vw), float32(vh))
+			prev.Styles[id] = st
+			recascaded++
+			for _, c := range doc.ComposedChildren(id) {
+				walkSubtree(c, &st)
+			}
+		} else {
+			for _, c := range n.Children {
+				walkSubtree(c, parent)
+			}
+		}
+	}
+
+	for _, subRoot := range roots {
+		var parentStyle *ComputedStyle
+		if pe, ok := doc.ParentElement(subRoot); ok {
+			if pst, found := prev.Styles[pe]; found {
+				cp := pst
+				parentStyle = &cp
+			}
+		}
+		walkSubtree(subRoot, parentStyle)
+	}
+	return prev, recascaded
 }
 
 func ComputeStylesParallel(doc *dom.Document, sheet *Stylesheet, vw, vh uint32) *StyleMap {

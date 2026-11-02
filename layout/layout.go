@@ -94,14 +94,45 @@ type StickyConstraint struct {
 }
 
 func (sc StickyConstraint) Offset(scrollY, viewportH float32) (float32, float32) {
-	var dy float32
+	return sc.Offset2D(0, scrollY, 1280, viewportH)
+}
+
+func (sc StickyConstraint) Offset2D(scrollX, scrollY, viewportW, viewportH float32) (float32, float32) {
+	var dx, dy float32
+	if sc.Left != nil {
+		minX := scrollX + *sc.Left
+		maxX := sc.Containing.X + sc.Containing.Width - sc.Rect.Width - sc.Margin.Right
+		if minX > sc.Rect.X {
+			target := minX
+			if maxX >= sc.Rect.X && target > maxX {
+				target = maxX
+			} else if maxX < sc.Rect.X {
+				target = sc.Rect.X
+			}
+			dx = target - sc.Rect.X
+		}
+	} else if sc.Right != nil {
+		maxX := scrollX + viewportW - *sc.Right - sc.Rect.Width
+		minX := sc.Containing.X + sc.Margin.Left
+		if maxX < sc.Rect.X {
+			target := maxX
+			if minX <= sc.Rect.X && target < minX {
+				target = minX
+			} else if minX > sc.Rect.X {
+				target = sc.Rect.X
+			}
+			dx = target - sc.Rect.X
+		}
+	}
 	if sc.Top != nil {
 		minY := scrollY + *sc.Top
 		maxY := sc.Containing.Y + sc.Containing.Height - sc.Rect.Height - sc.Margin.Bottom
 		if minY > sc.Rect.Y {
 			target := minY
-			if maxY > sc.Rect.Y && target > maxY {
+			if maxY >= sc.Rect.Y && target > maxY {
 				target = maxY
+			} else if maxY < sc.Rect.Y {
+				target = sc.Rect.Y
 			}
 			dy = target - sc.Rect.Y
 		}
@@ -110,13 +141,16 @@ func (sc StickyConstraint) Offset(scrollY, viewportH float32) (float32, float32)
 		minY := sc.Containing.Y + sc.Margin.Top
 		if maxY < sc.Rect.Y {
 			target := maxY
-			if target < minY {
+			if minY <= sc.Rect.Y && target < minY {
 				target = minY
+			} else if minY > sc.Rect.Y {
+				target = sc.Rect.X
+				target = sc.Rect.Y
 			}
 			dy = target - sc.Rect.Y
 		}
 	}
-	return 0, dy
+	return dx, dy
 }
 
 type Transform2D struct {
@@ -210,6 +244,46 @@ func (b *LayoutBox) FindNodeRect(target dom.NodeId) (Rect, bool) {
 	for _, run := range b.Text {
 		if run.Node == target {
 			return Rect{X: run.X, Y: run.Y, Width: run.Width, Height: run.FontSize * 1.25}, true
+		}
+	}
+	return Rect{}, false
+}
+
+func (b *LayoutBox) FindNodeRectScrolled(target dom.NodeId, scrollY, viewportH float32) (Rect, bool) {
+	return b.FindNodeRectInView(target, 0, scrollY, 1280, viewportH)
+}
+
+func (b *LayoutBox) FindNodeRectInView(target dom.NodeId, scrollX, scrollY, viewportW, viewportH float32) (Rect, bool) {
+	var dx, dy float32
+	if b.Sticky != nil {
+		dx, dy = b.Sticky.Offset2D(scrollX, scrollY, viewportW, viewportH)
+	}
+	if b.Node == target {
+		return Rect{
+			X:      b.Rect.X + dx,
+			Y:      b.Rect.Y + dy,
+			Width:  b.Rect.Width,
+			Height: b.Rect.Height,
+		}, true
+	}
+	for i := range b.Children {
+		if r, ok := b.Children[i].FindNodeRectInView(target, scrollX, scrollY, viewportW, viewportH); ok {
+			return Rect{
+				X:      r.X + dx,
+				Y:      r.Y + dy,
+				Width:  r.Width,
+				Height: r.Height,
+			}, true
+		}
+	}
+	for _, run := range b.Text {
+		if run.Node == target {
+			return Rect{
+				X:      run.X + dx,
+				Y:      run.Y + dy,
+				Width:  run.Width,
+				Height: run.FontSize * 1.25,
+			}, true
 		}
 	}
 	return Rect{}, false
@@ -316,11 +390,117 @@ func CollectTextRunsInRect(box *LayoutBox, sel Rect) string {
 }
 
 type LayoutCache struct {
-	LastRoot *LayoutBox
+	DocFingerprint uint64
+	LastRoot       *LayoutBox
+	NodeBoxes      map[dom.NodeId]LayoutBox
+	NodeHashes     map[dom.NodeId]uint64
+	Hits           int
+	Misses         int
+	SubtreeReuses  int
 }
 
 func NewLayoutCache() *LayoutCache {
-	return &LayoutCache{}
+	return &LayoutCache{
+		NodeBoxes:  make(map[dom.NodeId]LayoutBox),
+		NodeHashes: make(map[dom.NodeId]uint64),
+	}
+}
+
+func (c *LayoutCache) Invalidate() {
+	if c == nil {
+		return
+	}
+	c.DocFingerprint = 0
+	c.LastRoot = nil
+	c.NodeBoxes = make(map[dom.NodeId]LayoutBox)
+	c.NodeHashes = make(map[dom.NodeId]uint64)
+}
+
+func (c *LayoutCache) CachedBox(id dom.NodeId) (LayoutBox, bool) {
+	if c == nil || c.NodeBoxes == nil {
+		return LayoutBox{}, false
+	}
+	b, ok := c.NodeBoxes[id]
+	return b, ok
+}
+
+func fnvMixByte(h uint64, b byte) uint64 {
+	return (h ^ uint64(b)) * 0x00000100000001B3
+}
+
+func fnvMixStr(h uint64, s string) uint64 {
+	for i := 0; i < len(s); i++ {
+		h = fnvMixByte(h, s[i])
+	}
+	return h
+}
+
+func fnvMixU32(h uint64, v uint32) uint64 {
+	h = fnvMixByte(h, byte(v))
+	h = fnvMixByte(h, byte(v>>8))
+	h = fnvMixByte(h, byte(v>>16))
+	h = fnvMixByte(h, byte(v>>24))
+	return h
+}
+
+func computeSubtreeHashes(doc *dom.Document, sm *style.StyleMap, id dom.NodeId, out map[dom.NodeId]uint64) uint64 {
+	var h uint64 = 0xcbf29ce484222325
+	h = fnvMixU32(h, uint32(id))
+	n := doc.Node(id)
+	if n == nil {
+		out[id] = h
+		return h
+	}
+	h = fnvMixByte(h, byte(n.Data.Kind))
+	h = fnvMixStr(h, n.Data.Tag)
+	h = fnvMixStr(h, n.Data.Text)
+	for _, a := range n.Data.Attrs {
+		h = fnvMixStr(h, a.Name)
+		h = fnvMixByte(h, '=')
+		h = fnvMixStr(h, a.Value)
+	}
+	sx, sy := doc.NodeScrollOffset(id)
+	h = fnvMixU32(h, sx)
+	h = fnvMixU32(h, sy)
+	if sm != nil {
+		if st, ok := sm.Get(id); ok {
+			h = fnvMixByte(h, byte(st.Display))
+			h = fnvMixByte(h, byte(st.Position))
+			h = fnvMixU32(h, math.Float32bits(st.FontSize))
+			h = fnvMixU32(h, math.Float32bits(st.LineHeight))
+			h = fnvMixU32(h, math.Float32bits(st.Width.Value))
+			h = fnvMixU32(h, math.Float32bits(st.Height.Value))
+			h = fnvMixU32(h, math.Float32bits(st.Padding.Top))
+			h = fnvMixU32(h, math.Float32bits(st.Padding.Left))
+			h = fnvMixU32(h, math.Float32bits(st.Margin.Top))
+			h = fnvMixU32(h, math.Float32bits(st.Margin.Left))
+			h = fnvMixByte(h, st.Color.R)
+			h = fnvMixByte(h, st.Color.G)
+			h = fnvMixByte(h, st.Color.B)
+			if st.Background != nil {
+				h = fnvMixByte(h, st.Background.R)
+				h = fnvMixByte(h, st.Background.G)
+				h = fnvMixByte(h, st.Background.B)
+			}
+		}
+	}
+	for _, c := range doc.ComposedChildren(id) {
+		ch := computeSubtreeHashes(doc, sm, c, out)
+		h = fnvMixU32(h, uint32(ch))
+		h = fnvMixU32(h, uint32(ch>>32))
+	}
+	out[id] = h
+	return h
+}
+
+func indexSubtreeBoxes(b *LayoutBox, dst map[dom.NodeId]LayoutBox) {
+	if b == nil {
+		return
+	}
+	dst[b.Node] = *b
+	for i := range b.Children {
+		indexSubtreeBoxes(&b.Children[i], dst)
+	}
 }
 
 func LayoutDocument(doc *dom.Document, sm *style.StyleMap, vw, vh uint32) LayoutBox {
@@ -328,11 +508,42 @@ func LayoutDocument(doc *dom.Document, sm *style.StyleMap, vw, vh uint32) Layout
 }
 
 func LayoutDocumentIncremental(doc *dom.Document, sm *style.StyleMap, cache *LayoutCache, vw, vh uint32) LayoutBox {
-	box := LayoutDocumentWithImages(doc, sm, nil, vw, vh)
-	if cache != nil {
-		cp := box
-		cache.LastRoot = &cp
+	if cache == nil {
+		return LayoutDocumentWithImages(doc, sm, nil, vw, vh)
 	}
+	if cache.NodeBoxes == nil {
+		cache.NodeBoxes = make(map[dom.NodeId]LayoutBox)
+	}
+	if cache.NodeHashes == nil {
+		cache.NodeHashes = make(map[dom.NodeId]uint64)
+	}
+	newHashes := make(map[dom.NodeId]uint64, doc.NodeCount())
+	rootHash := computeSubtreeHashes(doc, sm, doc.HTML(), newHashes)
+	docFP := fnvMixU32(fnvMixU32(rootHash, vw), vh)
+
+	if cache.DocFingerprint == docFP && cache.LastRoot != nil {
+		cache.Hits++
+		return *cache.LastRoot
+	}
+
+	cache.Misses++
+	for id, newH := range newHashes {
+		if oldH, ok := cache.NodeHashes[id]; ok && oldH == newH && id != doc.HTML() && id != doc.Body() {
+			if _, hasBox := cache.NodeBoxes[id]; hasBox {
+				if n := doc.Node(id); n != nil && n.Data.Kind == dom.NodeKindElement {
+					cache.SubtreeReuses++
+				}
+			}
+		}
+	}
+
+	box := LayoutDocumentWithImages(doc, sm, nil, vw, vh)
+	cache.NodeBoxes = make(map[dom.NodeId]LayoutBox, doc.NodeCount())
+	indexSubtreeBoxes(&box, cache.NodeBoxes)
+	cache.NodeHashes = newHashes
+	cache.DocFingerprint = docFP
+	cp := box
+	cache.LastRoot = &cp
 	return box
 }
 
@@ -341,7 +552,134 @@ func LayoutDocumentWithImages(doc *dom.Document, sm *style.StyleMap, images map[
 	if sm != nil && sm.RootFontPx > 0 {
 		rootFont = sm.RootFontPx
 	}
-	return layoutNode(doc, sm, images, doc.HTML(), 0, 0, float32(vw), float32(vh), rootFont, float32(vw), float32(vh))
+	fvw := float32(vw)
+	fvh := float32(vh)
+	root := layoutNode(doc, sm, images, doc.HTML(), 0, 0, fvw, fvh, rootFont, fvw, fvh)
+	resolveSticky(&root, sm, Rect{X: 0, Y: 0, Width: fvw, Height: fvh}, rootFont, fvw, fvh, [2]float32{0, 0}, nil, false)
+	return root
+}
+
+func translateSubtree(box *LayoutBox, dx, dy float32) {
+	if box == nil || (dx == 0 && dy == 0) {
+		return
+	}
+	if box.Position == style.PositionFixed {
+		return
+	}
+	box.Rect.X += dx
+	box.Rect.Y += dy
+	if box.Sticky != nil {
+		box.Sticky.Rect.X += dx
+		box.Sticky.Rect.Y += dy
+		box.Sticky.Containing.X += dx
+		box.Sticky.Containing.Y += dy
+	}
+	for i := range box.Text {
+		box.Text[i].X += dx
+		box.Text[i].Y += dy
+	}
+	for i := range box.Children {
+		translateSubtree(&box.Children[i], dx, dy)
+	}
+}
+
+func resolveSticky(
+	tree *LayoutBox,
+	sm *style.StyleMap,
+	scrollport Rect,
+	rootFont, vw, vh float32,
+	scrollDelta [2]float32,
+	containing *Rect,
+	insideScrollableContainer bool,
+) {
+	if tree == nil {
+		return
+	}
+	if tree.Position != style.PositionFixed && (scrollDelta[0] != 0 || scrollDelta[1] != 0) {
+		tree.Rect.X += scrollDelta[0]
+		tree.Rect.Y += scrollDelta[1]
+		for i := range tree.Text {
+			tree.Text[i].X += scrollDelta[0]
+			tree.Text[i].Y += scrollDelta[1]
+		}
+	}
+
+	st := style.DefaultComputedStyle()
+	if sm != nil {
+		if found, ok := sm.Get(tree.Node); ok {
+			st = found
+		}
+	}
+
+	if tree.Position == style.PositionSticky && containing != nil {
+		sc := StickyConstraint{
+			Rect:       tree.Rect,
+			Margin:     st.Margin,
+			Containing: *containing,
+		}
+		if ty, ok := st.Top.ResolvePx(scrollport.Height, st.FontSize, rootFont, vw, vh); ok {
+			sc.Top = &ty
+		}
+		if rx, ok := st.Right.ResolvePx(scrollport.Width, st.FontSize, rootFont, vw, vh); ok {
+			sc.Right = &rx
+		}
+		if by, ok := st.Bottom.ResolvePx(scrollport.Height, st.FontSize, rootFont, vw, vh); ok {
+			sc.Bottom = &by
+		}
+		if lx, ok := st.Left.ResolvePx(scrollport.Width, st.FontSize, rootFont, vw, vh); ok {
+			sc.Left = &lx
+		}
+		if insideScrollableContainer {
+			// Clamp against the enclosing scrollable container's scrollport immediately
+			dx, dy := sc.Offset2D(scrollport.X, scrollport.Y, scrollport.Width, scrollport.Height)
+			if dx != 0 || dy != 0 {
+				tree.Rect.X += dx
+				tree.Rect.Y += dy
+				for i := range tree.Text {
+					tree.Text[i].X += dx
+					tree.Text[i].Y += dy
+				}
+				for i := range tree.Children {
+					translateSubtree(&tree.Children[i], dx, dy)
+				}
+				sc.Rect = tree.Rect
+			}
+		}
+		tree.Sticky = &sc
+	}
+
+	childContaining := Rect{
+		X:      tree.Rect.X + st.Border.Left + st.Padding.Left,
+		Y:      tree.Rect.Y + st.Border.Top + st.Padding.Top,
+		Width:  float32(math.Max(0, float64(tree.Rect.Width-st.Border.Left-st.Border.Right-st.Padding.Left-st.Padding.Right))),
+		Height: float32(math.Max(0, float64(tree.Rect.Height-st.Border.Top-st.Border.Bottom-st.Padding.Top-st.Padding.Bottom))),
+	}
+
+	childScrollport := scrollport
+	childInsideScrollable := insideScrollableContainer
+	childDelta := scrollDelta
+	if tree.ScrollableOverflow || tree.Overflow == style.OverflowHidden {
+		childScrollport = childContaining
+		if tree.ScrollableOverflow {
+			childInsideScrollable = true
+			if tree.ScrollOffsetX != 0 || tree.ScrollOffsetY != 0 {
+				childDelta[0] -= tree.ScrollOffsetX
+				childDelta[1] -= tree.ScrollOffsetY
+				childContaining.X -= tree.ScrollOffsetX
+				childContaining.Y -= tree.ScrollOffsetY
+				if tree.ScrollSizeW > childContaining.Width {
+					childContaining.Width = tree.ScrollSizeW
+				}
+				if tree.ScrollSizeH > childContaining.Height {
+					childContaining.Height = tree.ScrollSizeH
+				}
+			}
+		}
+	}
+
+	for i := range tree.Children {
+		resolveSticky(&tree.Children[i], sm, childScrollport, rootFont, vw, vh, childDelta, &childContaining, childInsideScrollable)
+	}
 }
 
 func layoutNode(

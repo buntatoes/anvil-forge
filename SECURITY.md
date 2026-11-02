@@ -10,4 +10,4 @@ Do not put the details in a public issue.
 
 The DOM (`MaxDomDepth = 256`, `MaxDomNodes = 50000`, `MaxAttrsPerElement = 128`), stylesheet (`MaxSelectorNesting = 64`, `MaxSelectorCompounds = 640`), and script/WASM (`MaxExecutionSteps = 200000`, `MaxScriptSourceLen = 256 KiB`, `MaxWasmSteps = 5000000`, `MaxWasmPages = 2560`) limits are enforced in pure Go across `dom`, `style`, `layout`, `paint`, `raster`, and `script`.
 
-Version 0.24.5.1 is current.
+Version 0.24.5.2 is current.

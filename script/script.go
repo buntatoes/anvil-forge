@@ -57,6 +57,12 @@ type eventListener struct {
 	handler   string
 }
 
+type HistoryEntry struct {
+	State string
+	Title string
+	URL   string
+}
+
 type ScriptRuntime struct {
 	PageURL              string
 	ConsoleLogs          []string
@@ -66,15 +72,25 @@ type ScriptRuntime struct {
 	FetchMocks           map[string]ScriptFetchReply
 	FetchHost            FetchHostFunc
 	Telemetry            CinderVmTelemetry
+	HistoryStack         []HistoryEntry
+	HistoryIndex         int
+	FormDataObjects      map[string]*dom.FormData
+	SearchParamsObjects  map[string][]dom.FormFieldPair
+	LastFetchURL         string
+	LastFetchMethod      string
+	LastFetchContentType string
+	LastFetchBody        string
 	listeners            map[dom.NodeId][]eventListener
+	windowListeners      []eventListener
 	unhandledRejections  int
 	abortReason          string
 	lastDefaultPrevented bool
 }
 
 func NewScriptRuntime() *ScriptRuntime {
+	initialURL := "https://example.invalid/"
 	return &ScriptRuntime{
-		PageURL:        "https://example.invalid/",
+		PageURL:        initialURL,
 		LocalStorage:   make(map[string]string),
 		SessionStorage: make(map[string]string),
 		Globals:        make(map[string]string),
@@ -82,12 +98,117 @@ func NewScriptRuntime() *ScriptRuntime {
 		Telemetry: CinderVmTelemetry{
 			KernelVersion: 24,
 		},
-		listeners: make(map[dom.NodeId][]eventListener),
+		HistoryStack: []HistoryEntry{
+			{State: "null", Title: "", URL: initialURL},
+		},
+		HistoryIndex:        0,
+		FormDataObjects:     make(map[string]*dom.FormData),
+		SearchParamsObjects: make(map[string][]dom.FormFieldPair),
+		listeners:           make(map[dom.NodeId][]eventListener),
 	}
 }
 
 func (rt *ScriptRuntime) SetPageOrigin(url string) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return
+	}
 	rt.PageURL = url
+	if len(rt.HistoryStack) <= 1 {
+		rt.HistoryStack = []HistoryEntry{
+			{State: "null", Title: "", URL: url},
+		}
+		rt.HistoryIndex = 0
+	}
+}
+
+func (rt *ScriptRuntime) CurrentURL() string {
+	return rt.PageURL
+}
+
+func (rt *ScriptRuntime) HistoryState() string {
+	if len(rt.HistoryStack) == 0 || rt.HistoryIndex < 0 || rt.HistoryIndex >= len(rt.HistoryStack) {
+		return "null"
+	}
+	return rt.HistoryStack[rt.HistoryIndex].State
+}
+
+func (rt *ScriptRuntime) HistoryLength() int {
+	if len(rt.HistoryStack) == 0 {
+		return 1
+	}
+	return len(rt.HistoryStack)
+}
+
+func (rt *ScriptRuntime) PushState(state, title, rawURL string) {
+	resolved := rt.PageURL
+	if strings.TrimSpace(rawURL) != "" && rawURL != "null" && rawURL != "undefined" {
+		resolved = dom.ResolveFormAction(rt.PageURL, rawURL)
+	}
+	if strings.TrimSpace(state) == "" {
+		state = "null"
+	}
+	if rt.HistoryIndex+1 < len(rt.HistoryStack) {
+		rt.HistoryStack = rt.HistoryStack[:rt.HistoryIndex+1]
+	}
+	rt.HistoryStack = append(rt.HistoryStack, HistoryEntry{
+		State: state,
+		Title: title,
+		URL:   resolved,
+	})
+	rt.HistoryIndex = len(rt.HistoryStack) - 1
+	rt.PageURL = resolved
+}
+
+func (rt *ScriptRuntime) ReplaceState(state, title, rawURL string) {
+	resolved := rt.PageURL
+	if strings.TrimSpace(rawURL) != "" && rawURL != "null" && rawURL != "undefined" {
+		resolved = dom.ResolveFormAction(rt.PageURL, rawURL)
+	}
+	if strings.TrimSpace(state) == "" {
+		state = "null"
+	}
+	if len(rt.HistoryStack) == 0 {
+		rt.HistoryStack = []HistoryEntry{{State: state, Title: title, URL: resolved}}
+		rt.HistoryIndex = 0
+	} else {
+		rt.HistoryStack[rt.HistoryIndex] = HistoryEntry{
+			State: state,
+			Title: title,
+			URL:   resolved,
+		}
+	}
+	rt.PageURL = resolved
+}
+
+func (rt *ScriptRuntime) HistoryGo(doc *dom.Document, delta int) error {
+	if len(rt.HistoryStack) == 0 {
+		return nil
+	}
+	target := rt.HistoryIndex + delta
+	if target < 0 || target >= len(rt.HistoryStack) || target == rt.HistoryIndex {
+		return nil
+	}
+	rt.HistoryIndex = target
+	entry := rt.HistoryStack[rt.HistoryIndex]
+	rt.PageURL = entry.URL
+	rt.Globals["__popstate_state"] = entry.State
+	for _, l := range rt.windowListeners {
+		if l.eventType == "popstate" {
+			if err := rt.EvalScript(doc, l.handler); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (rt *ScriptRuntime) HistoryBack(doc *dom.Document) error {
+	return rt.HistoryGo(doc, -1)
+}
+
+func (rt *ScriptRuntime) HistoryForward(doc *dom.Document) error {
+	return rt.HistoryGo(doc, 1)
 }
 
 func (rt *ScriptRuntime) SetFetchHost(fn FetchHostFunc) {
@@ -153,8 +274,8 @@ func (rt *ScriptRuntime) DispatchClick(doc *dom.Document, target dom.NodeId) err
 }
 
 func (rt *ScriptRuntime) DispatchInput(doc *dom.Document, target dom.NodeId, val string) error {
-	if n := doc.Node(target); n != nil {
-		n.Data.SetAttr("value", val)
+	if doc != nil {
+		doc.SetAttribute(target, "value", val)
 	}
 	return rt.dispatchEventOnNode(doc, target, "input")
 }
@@ -261,6 +382,92 @@ func (rt *ScriptRuntime) execStatement(doc *dom.Document, stmt string) error {
 		}
 		return nil
 	}
+	if (strings.HasPrefix(stmt, "window.addEventListener(") || strings.HasPrefix(stmt, "addEventListener(")) && strings.HasSuffix(stmt, ")") {
+		prefix := "window.addEventListener("
+		if strings.HasPrefix(stmt, "addEventListener(") {
+			prefix = "addEventListener("
+		}
+		inner := stmt[len(prefix) : len(stmt)-1]
+		ev, handler := splitTwoArgs(inner)
+		evName := rt.evalExpr(doc, ev)
+		body := extractFunctionBody(handler)
+		rt.windowListeners = append(rt.windowListeners, eventListener{
+			eventType: evName,
+			handler:   body,
+		})
+		return nil
+	}
+	// History API: history.pushState / replaceState / back / forward / go
+	trimmedHistory := strings.TrimPrefix(stmt, "window.")
+	if strings.HasPrefix(trimmedHistory, "history.pushState(") && strings.HasSuffix(trimmedHistory, ")") {
+		inner := trimmedHistory[len("history.pushState(") : len(trimmedHistory)-1]
+		args := splitArgs(inner)
+		var stArg, titleArg, urlArg string
+		if len(args) > 0 {
+			stArg = rt.evalExpr(doc, args[0])
+		}
+		if len(args) > 1 {
+			titleArg = rt.evalExpr(doc, args[1])
+		}
+		if len(args) > 2 {
+			urlArg = rt.evalExpr(doc, args[2])
+		}
+		rt.PushState(stArg, titleArg, urlArg)
+		return nil
+	}
+	if strings.HasPrefix(trimmedHistory, "history.replaceState(") && strings.HasSuffix(trimmedHistory, ")") {
+		inner := trimmedHistory[len("history.replaceState(") : len(trimmedHistory)-1]
+		args := splitArgs(inner)
+		var stArg, titleArg, urlArg string
+		if len(args) > 0 {
+			stArg = rt.evalExpr(doc, args[0])
+		}
+		if len(args) > 1 {
+			titleArg = rt.evalExpr(doc, args[1])
+		}
+		if len(args) > 2 {
+			urlArg = rt.evalExpr(doc, args[2])
+		}
+		rt.ReplaceState(stArg, titleArg, urlArg)
+		return nil
+	}
+	if trimmedHistory == "history.back()" {
+		return rt.HistoryBack(doc)
+	}
+	if trimmedHistory == "history.forward()" {
+		return rt.HistoryForward(doc)
+	}
+	if strings.HasPrefix(trimmedHistory, "history.go(") && strings.HasSuffix(trimmedHistory, ")") {
+		inner := trimmedHistory[len("history.go(") : len(trimmedHistory)-1]
+		delta, err := strconv.Atoi(strings.TrimSpace(rt.evalExpr(doc, inner)))
+		if err == nil {
+			return rt.HistoryGo(doc, delta)
+		}
+		return nil
+	}
+	// fetch(url, init)
+	fetchStmt := strings.TrimSpace(strings.TrimPrefix(stmt, "await "))
+	if strings.HasPrefix(fetchStmt, "fetch(") {
+		endParen := findMatchingCloseParen(fetchStmt, len("fetch"))
+		if endParen > len("fetch(") {
+			inner := fetchStmt[len("fetch("):endParen]
+			rt.execFetchCall(doc, inner)
+			return nil
+		}
+	}
+	// Method calls on FormData or URLSearchParams instances (e.g. fd.append(...), params.set(...))
+	if dot := strings.IndexByte(stmt, '.'); dot > 0 && !strings.HasPrefix(stmt, "document.") && !strings.HasPrefix(stmt, "window.") && !strings.HasPrefix(stmt, "localStorage.") && !strings.HasPrefix(stmt, "console.") {
+		recv := strings.TrimSpace(stmt[:dot])
+		rest := strings.TrimSpace(stmt[dot+1:])
+		if fd, ok := rt.FormDataObjects[recv]; ok {
+			rt.applyFormDataMethod(doc, fd, rest)
+			return nil
+		}
+		if _, ok := rt.SearchParamsObjects[recv]; ok {
+			rt.applySearchParamsMethod(doc, recv, rest)
+			return nil
+		}
+	}
 	// document.getElementById('x').textContent = ... / .innerHTML = ... / .setAttribute(...) / .addEventListener(...)
 	if targetID, rest, ok := rt.resolveDOMTarget(doc, stmt); ok {
 		return rt.applyDOMOperation(doc, targetID, rest)
@@ -272,6 +479,9 @@ func (rt *ScriptRuntime) execStatement(doc *dom.Document, stmt string) error {
 			if eq := strings.IndexByte(rest, '='); eq > 0 {
 				name := strings.TrimSpace(rest[:eq])
 				rhs := strings.TrimSpace(rest[eq+1:])
+				if rt.tryBindSpecialObject(doc, name, rhs) {
+					return nil
+				}
 				rt.Globals[name] = rt.evalExpr(doc, rhs)
 			}
 			return nil
@@ -281,9 +491,136 @@ func (rt *ScriptRuntime) execStatement(doc *dom.Document, stmt string) error {
 	if eq := strings.IndexByte(stmt, '='); eq > 0 && !strings.Contains(stmt[:eq], ".") {
 		name := strings.TrimSpace(stmt[:eq])
 		rhs := strings.TrimSpace(stmt[eq+1:])
+		if rt.tryBindSpecialObject(doc, name, rhs) {
+			return nil
+		}
 		rt.Globals[name] = rt.evalExpr(doc, rhs)
 	}
 	return nil
+}
+
+func (rt *ScriptRuntime) tryBindSpecialObject(doc *dom.Document, name, rhs string) bool {
+	if strings.HasPrefix(rhs, "new FormData(") && strings.HasSuffix(rhs, ")") {
+		inner := strings.TrimSpace(rhs[len("new FormData(") : len(rhs)-1])
+		if inner == "" {
+			rt.FormDataObjects[name] = dom.NewFormData()
+			return true
+		}
+		if doc != nil {
+			if formID, _, ok := rt.resolveDOMTarget(doc, inner+"."); ok {
+				rt.FormDataObjects[name] = dom.NewFormDataFromForm(doc, formID)
+				return true
+			}
+		}
+		rt.FormDataObjects[name] = dom.NewFormData()
+		return true
+	}
+	if strings.HasPrefix(rhs, "new URLSearchParams(") && strings.HasSuffix(rhs, ")") {
+		inner := strings.TrimSpace(rhs[len("new URLSearchParams(") : len(rhs)-1])
+		raw := ""
+		if inner != "" {
+			raw = rt.evalExpr(doc, inner)
+		}
+		rt.SearchParamsObjects[name] = parseSearchParamsInit(raw)
+		return true
+	}
+	if strings.HasPrefix(strings.TrimPrefix(rhs, "await "), "fetch(") {
+		fcall := strings.TrimPrefix(rhs, "await ")
+		endParen := findMatchingCloseParen(fcall, len("fetch"))
+		if endParen > len("fetch(") {
+			rt.execFetchCall(doc, fcall[len("fetch("):endParen])
+			rt.Globals[name] = rt.LastFetchBody
+			return true
+		}
+	}
+	return false
+}
+
+func (rt *ScriptRuntime) applyFormDataMethod(doc *dom.Document, fd *dom.FormData, rest string) {
+	if strings.HasPrefix(rest, "append(") && strings.HasSuffix(rest, ")") {
+		args := splitArgs(rest[len("append(") : len(rest)-1])
+		if len(args) >= 3 {
+			fd.AppendFile(rt.evalExpr(doc, args[0]), rt.evalExpr(doc, args[2]), "application/octet-stream", rt.evalExpr(doc, args[1]))
+		} else if len(args) >= 2 {
+			fd.Append(rt.evalExpr(doc, args[0]), rt.evalExpr(doc, args[1]))
+		}
+	} else if strings.HasPrefix(rest, "set(") && strings.HasSuffix(rest, ")") {
+		k, v := splitTwoArgs(rest[len("set(") : len(rest)-1])
+		fd.Set(rt.evalExpr(doc, k), rt.evalExpr(doc, v))
+	} else if strings.HasPrefix(rest, "delete(") && strings.HasSuffix(rest, ")") {
+		k := rt.evalExpr(doc, rest[len("delete("):len(rest)-1])
+		fd.Delete(k)
+	}
+}
+
+func (rt *ScriptRuntime) applySearchParamsMethod(doc *dom.Document, recv, rest string) {
+	pairs := rt.SearchParamsObjects[recv]
+	if strings.HasPrefix(rest, "append(") && strings.HasSuffix(rest, ")") {
+		k, v := splitTwoArgs(rest[len("append(") : len(rest)-1])
+		pairs = append(pairs, dom.FormFieldPair{Name: rt.evalExpr(doc, k), Value: rt.evalExpr(doc, v)})
+		rt.SearchParamsObjects[recv] = pairs
+	} else if strings.HasPrefix(rest, "set(") && strings.HasSuffix(rest, ")") {
+		k, v := splitTwoArgs(rest[len("set(") : len(rest)-1])
+		key := rt.evalExpr(doc, k)
+		val := rt.evalExpr(doc, v)
+		var next []dom.FormFieldPair
+		replaced := false
+		for _, p := range pairs {
+			if p.Name == key {
+				if !replaced {
+					next = append(next, dom.FormFieldPair{Name: key, Value: val})
+					replaced = true
+				}
+				continue
+			}
+			next = append(next, p)
+		}
+		if !replaced {
+			next = append(next, dom.FormFieldPair{Name: key, Value: val})
+		}
+		rt.SearchParamsObjects[recv] = next
+	} else if strings.HasPrefix(rest, "delete(") && strings.HasSuffix(rest, ")") {
+		key := rt.evalExpr(doc, rest[len("delete("):len(rest)-1])
+		var next []dom.FormFieldPair
+		for _, p := range pairs {
+			if p.Name != key {
+				next = append(next, p)
+			}
+		}
+		rt.SearchParamsObjects[recv] = next
+	}
+}
+
+func (rt *ScriptRuntime) execFetchCall(doc *dom.Document, inner string) {
+	args := splitArgs(inner)
+	if len(args) == 0 {
+		return
+	}
+	targetURL := dom.ResolveFormAction(rt.PageURL, rt.evalExpr(doc, args[0]))
+	method := "GET"
+	contentType := ""
+	body := ""
+	if len(args) >= 2 {
+		initStr := strings.TrimSpace(args[1])
+		if m := extractInitProp(initStr, "method"); m != "" {
+			method = strings.ToUpper(rt.evalExpr(doc, m))
+		}
+		if bExpr := extractInitProp(initStr, "body"); bExpr != "" {
+			if fd, ok := rt.FormDataObjects[bExpr]; ok {
+				body, contentType = fd.EncodeMultipart(dom.DefaultMultipartBoundary)
+			} else if sp, ok := rt.SearchParamsObjects[bExpr]; ok {
+				body = dom.SerializeFormFields(sp)
+				contentType = "application/x-www-form-urlencoded;charset=UTF-8"
+			} else {
+				body = rt.evalExpr(doc, bExpr)
+				contentType = "text/plain;charset=UTF-8"
+			}
+		}
+	}
+	rt.LastFetchURL = targetURL
+	rt.LastFetchMethod = method
+	rt.LastFetchContentType = contentType
+	rt.LastFetchBody = body
 }
 
 func (rt *ScriptRuntime) resolveDOMTarget(doc *dom.Document, stmt string) (dom.NodeId, string, bool) {
@@ -334,27 +671,27 @@ func (rt *ScriptRuntime) applyDOMOperation(doc *dom.Document, id dom.NodeId, op 
 	if strings.HasPrefix(op, ".setAttribute(") && strings.HasSuffix(op, ")") {
 		inner := op[len(".setAttribute(") : len(op)-1]
 		k, v := splitTwoArgs(inner)
-		n.Data.SetAttr(rt.evalExpr(doc, k), rt.evalExpr(doc, v))
+		doc.SetAttribute(id, rt.evalExpr(doc, k), rt.evalExpr(doc, v))
 		return nil
 	}
 	if strings.HasPrefix(op, ".removeAttribute(") && strings.HasSuffix(op, ")") {
 		inner := op[len(".removeAttribute(") : len(op)-1]
-		n.Data.RemoveAttr(rt.evalExpr(doc, inner))
+		doc.RemoveAttribute(id, rt.evalExpr(doc, inner))
 		return nil
 	}
 	if strings.HasPrefix(op, ".classList.add(") && strings.HasSuffix(op, ")") {
 		inner := op[len(".classList.add(") : len(op)-1]
-		n.Data.AddClass(rt.evalExpr(doc, inner))
+		doc.AddClass(id, rt.evalExpr(doc, inner))
 		return nil
 	}
 	if strings.HasPrefix(op, ".classList.remove(") && strings.HasSuffix(op, ")") {
 		inner := op[len(".classList.remove(") : len(op)-1]
-		n.Data.RemoveClass(rt.evalExpr(doc, inner))
+		doc.RemoveClass(id, rt.evalExpr(doc, inner))
 		return nil
 	}
 	if strings.HasPrefix(op, ".classList.toggle(") && strings.HasSuffix(op, ")") {
 		inner := op[len(".classList.toggle(") : len(op)-1]
-		n.Data.ToggleClass(rt.evalExpr(doc, inner))
+		doc.ToggleClass(id, rt.evalExpr(doc, inner))
 		return nil
 	}
 	if strings.HasPrefix(op, ".addEventListener(") && strings.HasSuffix(op, ")") {
@@ -380,6 +717,68 @@ func (rt *ScriptRuntime) evalExpr(doc *dom.Document, expr string) string {
 		k := rt.evalExpr(doc, e[len("localStorage.getItem("):len(e)-1])
 		return rt.LocalStorage[k]
 	}
+	switch strings.TrimPrefix(e, "window.") {
+	case "location.href":
+		return rt.PageURL
+	case "location.pathname":
+		return urlPathname(rt.PageURL)
+	case "location.search":
+		return urlSearch(rt.PageURL)
+	case "location.hash":
+		return urlHash(rt.PageURL)
+	case "history.state":
+		return rt.HistoryState()
+	case "history.length":
+		return strconv.Itoa(rt.HistoryLength())
+	case "event.state", "e.state":
+		return rt.Globals["__popstate_state"]
+	}
+	if dot := strings.IndexByte(e, '.'); dot > 0 {
+		recv := strings.TrimSpace(e[:dot])
+		rest := strings.TrimSpace(e[dot+1:])
+		if fd, ok := rt.FormDataObjects[recv]; ok {
+			if strings.HasPrefix(rest, "get(") && strings.HasSuffix(rest, ")") {
+				v, _ := fd.Get(rt.evalExpr(doc, rest[len("get("):len(rest)-1]))
+				return v
+			}
+			if strings.HasPrefix(rest, "has(") && strings.HasSuffix(rest, ")") {
+				if fd.Has(rt.evalExpr(doc, rest[len("has("):len(rest)-1])) {
+					return "true"
+				}
+				return "false"
+			}
+			if rest == "toMultipart()" {
+				body, _ := fd.EncodeMultipart(dom.DefaultMultipartBoundary)
+				return body
+			}
+			if rest == "toUrlEncoded()" {
+				return fd.EncodeURLEncoded()
+			}
+		}
+		if pairs, ok := rt.SearchParamsObjects[recv]; ok {
+			if strings.HasPrefix(rest, "get(") && strings.HasSuffix(rest, ")") {
+				key := rt.evalExpr(doc, rest[len("get("):len(rest)-1])
+				for _, p := range pairs {
+					if p.Name == key {
+						return p.Value
+					}
+				}
+				return ""
+			}
+			if strings.HasPrefix(rest, "has(") && strings.HasSuffix(rest, ")") {
+				key := rt.evalExpr(doc, rest[len("has("):len(rest)-1])
+				for _, p := range pairs {
+					if p.Name == key {
+						return "true"
+					}
+				}
+				return "false"
+			}
+			if rest == "toString()" {
+				return dom.SerializeFormFields(pairs)
+			}
+		}
+	}
 	if doc != nil && strings.HasPrefix(e, "document.getElementById(") && strings.HasSuffix(e, ").textContent") {
 		end := strings.IndexByte(e, ')')
 		if end > 0 {
@@ -403,6 +802,144 @@ func (rt *ScriptRuntime) evalExpr(doc *dom.Document, expr string) string {
 		return lhs + rhs
 	}
 	return e
+}
+
+func urlPathname(raw string) string {
+	schemeEnd := strings.Index(raw, "://")
+	rest := raw
+	if schemeEnd >= 0 {
+		rest = raw[schemeEnd+3:]
+	}
+	slashIdx := strings.IndexByte(rest, '/')
+	if slashIdx < 0 {
+		return "/"
+	}
+	path := rest[slashIdx:]
+	if qIdx := strings.IndexAny(path, "?#"); qIdx >= 0 {
+		path = path[:qIdx]
+	}
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+func urlSearch(raw string) string {
+	noHash := raw
+	if hIdx := strings.IndexByte(noHash, '#'); hIdx >= 0 {
+		noHash = noHash[:hIdx]
+	}
+	if qIdx := strings.IndexByte(noHash, '?'); qIdx >= 0 && qIdx+1 < len(noHash) {
+		return noHash[qIdx:]
+	}
+	return ""
+}
+
+func urlHash(raw string) string {
+	if hIdx := strings.IndexByte(raw, '#'); hIdx >= 0 && hIdx+1 < len(raw) {
+		return raw[hIdx:]
+	}
+	return ""
+}
+
+func parseSearchParamsInit(raw string) []dom.FormFieldPair {
+	s := strings.TrimPrefix(strings.TrimSpace(raw), "?")
+	if s == "" {
+		return nil
+	}
+	var out []dom.FormFieldPair
+	for _, part := range strings.Split(s, "&") {
+		if part == "" {
+			continue
+		}
+		if eq := strings.IndexByte(part, '='); eq >= 0 {
+			out = append(out, dom.FormFieldPair{Name: part[:eq], Value: part[eq+1:]})
+		} else {
+			out = append(out, dom.FormFieldPair{Name: part, Value: ""})
+		}
+	}
+	return out
+}
+
+func findMatchingCloseParen(s string, openSearchFrom int) int {
+	depth := 0
+	var quote byte
+	for i := openSearchFrom; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && i+1 < len(s) {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'', '`':
+			quote = c
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func splitArgs(inner string) []string {
+	var args []string
+	start := 0
+	depth := 0
+	var quote byte
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if quote != 0 {
+			if c == '\\' && i+1 < len(inner) {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'', '`':
+			quote = c
+		case '(', '{', '[':
+			depth++
+		case ')', '}', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				args = append(args, strings.TrimSpace(inner[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(inner[start:]); tail != "" {
+		args = append(args, tail)
+	}
+	return args
+}
+
+func extractInitProp(initObj, key string) string {
+	s := strings.TrimSpace(initObj)
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	for _, entry := range splitArgs(s) {
+		colon := strings.IndexByte(entry, ':')
+		if colon > 0 {
+			k := trimQuotes(entry[:colon])
+			if k == key {
+				return strings.TrimSpace(entry[colon+1:])
+			}
+		}
+	}
+	return ""
 }
 
 func splitJSStatements(src string) []string {

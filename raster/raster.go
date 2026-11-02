@@ -414,12 +414,26 @@ func RasterizeScrolled(dl *paint.DisplayList, width, height uint32, scrollY floa
 	clipStack := []clipRect{fb.defaultClip()}
 	fixedDepth := 0
 
-	for _, item := range dl.Items {
+	fvw := float32(width)
+	fvh := float32(height)
+	for idx, item := range dl.Items {
 		curClip := clipStack[len(clipStack)-1]
 		sy := scrollY
 		if fixedDepth > 0 {
 			sy = 0
 		}
+		var stickyDX, stickyDY float32
+		if fixedDepth == 0 {
+			for _, ly := range dl.Layers {
+				if ly.Effect.Kind == paint.LayerSticky && idx >= ly.Start && idx < ly.End {
+					dx, dy := ly.Effect.Sticky.Offset2D(0, scrollY, fvw, fvh)
+					stickyDX += dx
+					stickyDY += dy
+				}
+			}
+		}
+		ix := item.X + stickyDX
+		iy := item.Y + stickyDY - sy
 		switch item.Kind {
 		case paint.ItemPushFixed:
 			fixedDepth++
@@ -429,10 +443,10 @@ func RasterizeScrolled(dl *paint.DisplayList, width, height uint32, scrollY floa
 			}
 		case paint.ItemPushClip:
 			nc := intersectClip(curClip, clipRect{
-				x0: int(math.Floor(float64(item.X))),
-				y0: int(math.Floor(float64(item.Y - sy))),
-				x1: int(math.Ceil(float64(item.X + item.Width))),
-				y1: int(math.Ceil(float64(item.Y - sy + item.Height))),
+				x0: int(math.Floor(float64(ix))),
+				y0: int(math.Floor(float64(iy))),
+				x1: int(math.Ceil(float64(ix + item.Width))),
+				y1: int(math.Ceil(float64(iy + item.Height))),
 			})
 			clipStack = append(clipStack, nc)
 		case paint.ItemPopClip:
@@ -440,17 +454,17 @@ func RasterizeScrolled(dl *paint.DisplayList, width, height uint32, scrollY floa
 				clipStack = clipStack[:len(clipStack)-1]
 			}
 		case paint.ItemRect:
-			fb.FillRectClipped(item.X, item.Y-sy, item.Width, item.Height, item.Color, curClip)
+			fb.FillRectClipped(ix, iy, item.Width, item.Height, item.Color, curClip)
 		case paint.ItemRoundedRect:
-			fb.FillRoundedRectSdf(item.X, item.Y-sy, item.Width, item.Height, item.Radius, item.BorderWidth, item.FillColor, item.BorderColor, curClip)
+			fb.FillRoundedRectSdf(ix, iy, item.Width, item.Height, item.Radius, item.BorderWidth, item.FillColor, item.BorderColor, curClip)
 		case paint.ItemBoxShadow:
-			fb.FillBoxShadowSdf(item.X, item.Y-sy, item.Width, item.Height, item.OffsetX, item.OffsetY, item.BlurRadius, item.SpreadRadius, item.Radius, item.Color, curClip)
+			fb.FillBoxShadowSdf(ix, iy, item.Width, item.Height, item.OffsetX, item.OffsetY, item.BlurRadius, item.SpreadRadius, item.Radius, item.Color, curClip)
 		case paint.ItemLinearGradientRect:
-			fb.FillLinearGradientSdf(item.X, item.Y-sy, item.Width, item.Height, item.Radius, item.BorderWidth, item.AngleDeg, item.StartColor, item.EndColor, item.BorderColor, curClip)
+			fb.FillLinearGradientSdf(ix, iy, item.Width, item.Height, item.Radius, item.BorderWidth, item.AngleDeg, item.StartColor, item.EndColor, item.BorderColor, curClip)
 		case paint.ItemImage:
-			fb.BlitImage(item.X, item.Y-sy, item.Width, item.Height, item.Radius, item.Image, curClip)
+			fb.BlitImage(ix, iy, item.Width, item.Height, item.Radius, item.Image, curClip)
 		case paint.ItemText:
-			fb.DrawText(item.X, item.Y-sy, item.FontSize, item.Text, item.Color, curClip)
+			fb.DrawText(ix, iy, item.FontSize, item.Text, item.Color, curClip)
 		}
 	}
 	return fb

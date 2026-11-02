@@ -15,7 +15,7 @@ func TestCLISelfTestAndRender(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("self-test failed (%d): %s", code, errBuf.String())
 	}
-	if !strings.Contains(out.String(), "anvil-engine 0.24.5.1 (Forge/Prism/Cinder) ok") {
+	if !strings.Contains(out.String(), "anvil-engine 0.24.5.2 (Forge/Prism/Cinder) ok") {
 		t.Fatalf("unexpected self-test output: %q", out.String())
 	}
 
